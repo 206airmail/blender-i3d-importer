@@ -362,7 +362,7 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         #   - i3D_exportFileLocation = EXPORT_DIR + basename of the imported i3d
         try:
             settings = bpy.context.scene.I3D_UIexportSettings
-            settings.i3D_gameLocationDisplay = FS25_DATA_BASE + "\\"
+            settings.i3D_gameLocationDisplay = FS25_DATA_BASE.rstrip("\\/") + "\\"
             settings.i3D_exportUseSoftwareFileName = False
             if EXPORT_DIR:
                 settings.i3D_exportFileLocation = str(Path(EXPORT_DIR) / i3d.name)
