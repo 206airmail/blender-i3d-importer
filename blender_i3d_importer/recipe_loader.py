@@ -314,7 +314,6 @@ def _make_param_value_inverted(nt, param_name, default_value, location,
     sub.inputs[0].default_value = 1.0
     sub.location = (location[0] + 200, location[1])
     sub.label = f"1 - {label or param_name}"
-    sub.parent = _ensure_param_frame(nt)
     nt.links.new(val.outputs[0], sub.inputs[1])
     if target_input is not None:
         nt.links.new(sub.outputs[0], target_input)
