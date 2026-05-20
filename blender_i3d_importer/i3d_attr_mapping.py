@@ -94,6 +94,9 @@ SCENE_ATTR_MAP: Dict[str, Tuple[str, Callable]] = {
     # but from visible_in_viewport_get() - re-export fidelity therefore comes
     # via the hide logic. Entry here is informational.
     'visibility':                   ('i3D_visibility',                   _to_bool),
+    # lockedgroup: exporter uses lowercase 'g' XML name (dccBlender writes
+    # "lockedgroup" -> "i3D_lockedGroup"). Importer needs the same casing.
+    'lockedgroup':                  ('i3D_lockedGroup',                  _to_bool),
     'castsShadows':                 ('i3D_castsShadows',                 _to_bool),
     'castsShadowsPerInstance':      ('i3D_castsShadowsPerInstance',      _to_bool),
     'receiveShadows':               ('i3D_receiveShadows',               _to_bool),
@@ -103,12 +106,27 @@ SCENE_ATTR_MAP: Dict[str, Tuple[str, Callable]] = {
     'renderInvisible':              ('i3D_renderInvisible',              _to_bool),
     'visibleShaderParam':           ('i3D_visibleShaderParam',           _to_float),
     'clipDistance':                 ('i3D_clipDistance',                 _to_float),
-    'objectMask':                   ('i3D_objectMask',                   _to_int),
-    'navMeshMask':                  ('i3D_navMeshMask',                  _to_int),
+    # objectMask / navMeshMask are uint32 bitmasks. Giants exporter declares
+    # them as TYPE_INT, but values with the high bit set (e.g. sun lights with
+    # objectMask=0x83ff0000 = 2214592512) overflow Blender's signed int32
+    # IDProperty. We store them as decimal-string instead; the exporter's
+    # _xmlWriteAttr (i3d_export.py:1359) parses strings on TYPE_INT props via
+    # int(value, 0) and writes them back as decimal — format drift (hex->dec)
+    # but functionally identical.
+    'objectMask':                   ('i3D_objectMask',                   _hex_or_dec_to_decstr),
+    # navMeshMask: legacy XML name (FS22 / pre-v10). FS25 emits buildNavMeshMask.
+    # Both names map to the same Blender property so the importer handles both.
+    'navMeshMask':                  ('i3D_navMeshMask',                  _hex_or_dec_to_decstr),
+    'buildNavMeshMask':             ('i3D_navMeshMask',                  _hex_or_dec_to_decstr),
     'doubleSided':                  ('i3D_doubleSided',                  _to_bool),
     'decalLayer':                   ('i3D_decalLayer',                   _to_int),
     'terrainDecal':                 ('i3D_terrainDecal',                 _to_bool),
     'cpuMesh':                      ('i3D_cpuMesh',                      _to_bool),
+    # occluder: maps to i3D_oc (not i3D_occluder!) per dccBlender.py SETTINGS_ATTRIBUTES.
+    # Critical for the .i3d.shapes options high_bit 0x02000000 roundtrip — without
+    # this mapping the XML attribute falls into _i3d_raw_occluder and is lost on
+    # re-export, so i3dConverter.exe no longer marks the shape as occluder.
+    'occluder':                     ('i3D_oc',                           _to_bool),
     'mergeGroup':                   ('i3D_mergeGroup',                   _to_int),
     'mergeGroupRoot':               ('i3D_mergeGroupRoot',               _to_bool),
     'boundingVolume':               ('i3D_boundingVolume',               _to_str),
@@ -154,8 +172,14 @@ SCENE_ATTR_MAP: Dict[str, Tuple[str, Callable]] = {
     'minuteOfDayEnd':               ('i3D_minuteOfDayEnd',               _to_int),
     'dayOfYearStart':               ('i3D_dayOfYearStart',               _to_int),
     'dayOfYearEnd':                 ('i3D_dayOfYearEnd',                 _to_int),
-    'weatherMask':                  ('i3D_weatherMask',                  _hex_or_dec_to_decstr),
-    'viewerSpacialityMask':         ('i3D_viewerSpacialityMask',         _hex_or_dec_to_decstr),
+    # XML key spelling matches the Giants exporter (i3d_export.py:1090-1093):
+    # the *Required* attributes are written from the i3D_weatherMask /
+    # i3D_viewerSpacialityMask Blender props (without 'Required' in the
+    # property name). Both halves of the mapping verified against FS25 and
+    # FS22 game data: only 'weatherRequiredMask' / 'viewerSpacialityRequiredMask'
+    # appear in the XML, never the un-prefixed forms.
+    'weatherRequiredMask':          ('i3D_weatherMask',                  _hex_or_dec_to_decstr),
+    'viewerSpacialityRequiredMask': ('i3D_viewerSpacialityMask',         _hex_or_dec_to_decstr),
     'weatherPreventMask':           ('i3D_weatherPreventMask',           _hex_or_dec_to_decstr),
     'viewerSpacialityPreventMask':  ('i3D_viewerSpacialityPreventMask',  _hex_or_dec_to_decstr),
 
@@ -174,7 +198,10 @@ SCENE_ATTR_MAP: Dict[str, Tuple[str, Callable]] = {
     'softShadowsLightDistance':     ('i3D_softShadowsLightDistance',     _to_float),
     'softShadowsDepthBiasFactor':   ('i3D_softShadowsDepthBiasFactor',   _to_float),
     'softShadowsMaxPenumbraSize':   ('i3D_softShadowsMaxPenumbraSize',   _to_float),
+    # isLightScattering: legacy XML name. FS25 exporter emits short form 'scattering'.
+    # Both names map to the same Blender property.
     'isLightScattering':            ('i3D_isLightScattering',            _to_bool),
+    'scattering':                   ('i3D_isLightScattering',            _to_bool),
     'lightScatteringIntensity':     ('i3D_lightScatteringIntensity',     _to_float),
     'lightScatteringConeAngle':     ('i3D_lightScatteringConeAngle',     _to_float),
     'iesProfileFile':               ('i3D_iesProfileFile',               _to_str),

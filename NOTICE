@@ -2,27 +2,23 @@ This software includes third-party components, listed below with their
 original copyright notices and license terms.
 
 ================================================================================
-i3dToObjx (bundled as bin/i3dToObjx.exe)
+I3DShapesTool (Python port)
 ================================================================================
 
-The bundled .exe is built from a modified version of the I3DShapesTool-OBJx
-project, which is itself a fork of the original I3DShapesTool.
+The .i3d.shapes binary decoder in this add-on (modules i3d_shapes_reader,
+i3d_shapes_models, i3d_shapes_to_meshdata, _cipher_keys) is a Python port
+of the C# decoder logic from the I3DShapesTool project. Earlier releases
+of this add-on bundled a Windows .exe built from a fork of the same
+project; that .exe has been removed in favor of the pure-Python
+implementation, but the attribution remains because the decoding logic
+is still substantially derived from the original work.
 
 Original project:
     I3DShapesTool
     Author:  Daniel Hultgren (Donkie)
     Source:  https://github.com/Donkie/I3DShapesTool
 
-Upstream fork:
-    I3DShapesTool-OBJx
-    Author:  VidhosticeSDK
-    Source:  https://github.com/VidhosticeSDK/I3DShapesTool-OBJx
-
-Local modifications by Nadine Brinkmann:
-    Source:  https://github.com/nadine-brinkmann/i3d-to-objx
-    Changes: see commit history; among others, added spline export (patches/03).
-
-The following original license applies to all derivatives of the above:
+The following original license applies:
 
 --------------------------------------------------------------------------------
 

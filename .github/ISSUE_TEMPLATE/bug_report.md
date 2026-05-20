@@ -11,10 +11,11 @@ assignees: ''
 A clear and concise description of what the bug is.
 
 **To Reproduce**
-Steps to reproduce the behavior:
+Steps to reproduce the behavior :
+(Example:)
 1. Go to '...'
 2. Click on '....'
-3. Scroll down to '....'
+3. Import i3d file '....'
 4. See error
 
 **Expected behavior**
@@ -27,6 +28,7 @@ If applicable, add screenshots to help explain your problem.
  - OS: [e.g. Windows 11]
  - Blender Version [e.g. 5.1]
  - Game Version [e.g. 22]
+ - Which i3d did you open? Base-game? Which one?
 
 **Additional context**
 Add any other context about the problem here.

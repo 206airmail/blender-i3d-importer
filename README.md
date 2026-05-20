@@ -1,99 +1,209 @@
 # Blender i3d Importer
 
-Import Farming Simulator 22 & 25 `.i3d` files into Blender, with full geometry,
-materials, lights, cameras, and round-trip support to the official Giants i3d Exporter.
+**The first and only Blender add-on that imports Farming Simulator 22 & 25
+`.i3d` files directly — full scene, materials, textures, ready for editing,
+re-export-clean to the official Giants i3d Exporter.**
 
-## Features
+No external extraction tool, no command-line gymnastics: the `.i3d.shapes`
+binary is decoded natively in Python. Geometry, splines, skin weights,
+lights, cameras, references, notes, terrain — everything that ships in an
+FS22/FS25 i3d file becomes proper Blender datablocks you can inspect,
+modify, and (mostly) round-trip back into the Giants Editor through 
+the Giants i3d Exporter.
 
-- **Full scene hierarchy** — meshes, empties, lights, cameras, splines, reference nodes
-- **Two material flavors per i3d material:**
-  - *Re-export material* — round-trip compatible with the Giants i3d Exporter
-  - *PBR debug material* (optional) — visually accurate preview similar to the Giants Editor view
-- **Multi-UV and vertex colors** — UV1, UV2, UV3, UV4 plus corner vertex colors
-- **Custom properties preserved** — all i3d node and material attributes carry over to Blender
-- **Smart path resolution** — `$data/...` and relative paths, DDS preferred over PNG
-- **Axis correction** — optional Y-up → Z-up conversion at import
-- **Auto-hide** — invisible shapes hidden in the viewport, matching the Giants Editor behavior
-- **N-panel controls** — switch between debug and re-export materials, edit shader parameters
-  (color tints, dirt, snow, clear coat, etc.), inspect masks and vertex colors, show/hide snow heaps
+## What it can do
+
+### Geometry & hierarchy
+
+- Full scene tree: meshes, materials, textures, lights, cameras, splines, 
+  reference nodes (with patch for the exporter), also terrain!
+- Native Python decoder for `.i3d.shapes` v7 / v9 / v10 
+  (no external tool required)
+- Shared meshes are split up into individuals + merged back upon export
+- Skin weights for vehicle-implement bones (rotation + translation
+  correct, verified on Amazone Precea 4500 / Seeder joints)
+  (correct scene graph placement needs lua script, Blender limitation)
+- Merge groups & merge-children splitting
+- Splines (open and closed) 
+- Heightmap-based terrain as a Plane + Displace modifier (terrain as
+  preview only, not exportable, see [Known limitations](#known-limitations))
+
+### Materials — two flavors per i3d material
+
+- **Re-export material** — clean round-trip with the Giants Exporter,
+  preserves every `<CustomParameter>` and `<Custommap>` 
+  and also options on the shape
+- **PBR debug material** (optional) — visually mimics the Giants Editor
+  look, with editable sliders for vehicle brand colors, multitints,
+  clear coat, scratches/dirt/snow/wetness, parallax, etc.
+- Pair-aware: switch any mesh between debug and re-export material 
+  with a click; changes to debug sliders can be synced back to the 
+  export material before re-export
+- **Multiple imports in the same scene possible** — per-import
+  UUIDs disambiguate materials that share `material_id` across files
+
+### UV, vertex data, custom properties
+
+- UV1, UV2, UV3, UV4 channels
+- Corner vertex colors
+- Every i3d attribute (visibility, weather masks, navMesh masks,
+  collision flags, clip distance, ...) survives as a Blender custom
+  property — re-export-ready
+
+### Smart path resolution
+
+- `$data/...` resolved against the configured FS25 game folder
+- DDS preferred over PNG when both exist
+- $-substitution also works for terrain heightmap files
+
+
+### Axis correction & visibility
+
+- Optional Y-up → Z-up bake at import 
+- Auto-hide objects flagged `visibility="false"` or `nonRenderable="true"`
+  (matches the Giants Editor render-view behavior)
+
+### N-panel workflow tools (`N` in the 3D viewport, tab "i3d Importer")
+
+- **Material Switch** — toggle the selected meshes between debug and
+  re-export materials
+- **FS25 Material Settings** — sliders for every `material parameter` of the
+  active debug material, plus a **Sync to Export Material** button that
+  copies the slider values back to the paired export material's
+  `custom Parameter` properties (required before re-export)
+- **FS25 Debug View** — overlay masks or vertex colors on the active
+  material for inspection
+- **FS25 Snow + Ice** — show/hide all snow/icicle meshes; reminds you to
+  un-hide them before re-export
+- **FS25 Invisible GE-objects** — show/hide all objects that were
+  auto-hidden because they are invisible in the Giants Editor (e.g.
+  collision volumes); reminds you to un-hide them before re-export
+
+### Convenience after import
+
+- Viewport switches to Material Preview shading
+- All imported objects are framed (Numpad-`.`-equivalent)
+- Clip-end is bumped to 10000 when an imported object is larger than
+  500 units (whole maps no longer disappear behind the default far
+  clip)
+- prefills Game path & export path in the Giants id3 exporter so you  
+  don't have to set it every time
 
 ## Requirements
 
 - **Blender 5.1 or newer**
-- **Farming Simulator 25** installed locally (or FS22) — needed for resolving texture and shader
-  paths. The add-on never modifies your game files.
-- **Windows** — the bundled extraction tool is a Windows binary
-- *Optional:* the [Parallax Node Extension](https://extensions.blender.org/add-ons/parallax-node/)
-  for real parallax occlusion mapping in debug materials (bump-mapping fallback otherwise)
+- **Farming Simulator 25** (or FS22) installed locally — needed to
+  resolve `$data/...` texture and shader paths. The add-on never
+  modifies your game files.
+- **Operating system:** Windows is regularly tested and supported.
+  Linux and macOS should work in principle since the decoder is pure
+  Python and the add-on has no native binaries, but they are
+  **untested** — please open an issue if you try them.
+- *Optional:* the
+  [Parallax Node Extension](https://extensions.blender.org/add-ons/parallax-node/)
+  for true parallax occlusion mapping in debug materials (a simpler
+  bump-mapping fallback is used otherwise)
 
 ## Installation
 
 ### Drag & Drop (recommended)
 
-1. Download the latest `blender_i3d_importer.zip` from the [Releases](../../releases) page.
+1. Download the latest `blender_i3d_importer.zip` from the
+   [Releases](../../releases) page.
 2. Open Blender.
 3. Drag the `.zip` file from your file manager onto the Blender window.
 4. Confirm the install prompt.
 
 ### Via Preferences
 
-1. Download the latest `blender_i3d_importer.zip` from the [Releases](../../releases) page.
-2. In Blender, go to `Edit` → `Preferences` → `Add-ons`.
+1. Download the latest `blender_i3d_importer.zip` from the
+   [Releases](../../releases) page.
+2. In Blender, `Edit` → `Preferences` → `Add-ons`.
 3. Click the dropdown arrow in the top-right → `Install from Disk...`
 4. Select the downloaded `.zip` file.
 5. Enable the add-on by ticking the checkbox next to its name.
 
 ## First-time setup
 
-1. Open `Edit` → `Preferences` → `Add-ons` and find **i3d Importer**.
-2. Expand its preferences and set the **FS25 game data folder** to your FS25 installation root
-   (the folder that contains the `data/` subfolder).
-3. *Optional:* set the **Export folder** if you plan to re-export through the Giants i3d Exporter.
+1. `Edit` → `Preferences` → `Add-ons` → find **i3d Importer**.
+2. Expand its preferences. They are grouped in three sections:
+   - **Paths** — set **FS25 game data folder** to your FS25 installation
+     root (the folder that contains the `data/` subfolder). Optionally
+     set **Re-export output folder**.
+   - **Import Defaults** — defaults for the per-import operator options
+     (axis correction, auto-hide, debug materials, etc.).
+   - **Terrain** — default LOD, base color for the terrain preview, and
+     the comma-separated list of `<CombinedLayer>` names to load (up to
+     5; default covers ASPHALT, GRASS, MUD, FOREST_LEAVES, FOREST_GRASS).
 
 ## How to use
 
 `File` → `Import` → `Farming Simulator i3d (.i3d)`
 
-In the import dialog you can toggle axis correction, auto-hide, debug material creation, and
-whether debug materials should be attached to the mesh by default.
+In the import dialog you can override per-import options that default
+from the add-on preferences (axis correction, auto-hide, debug
+materials, terrain LOD, base color, layer names).
 
-After import, the **3D viewport sidebar** (press `N`) offers four panels:
-
-- **i3d Importer** — switch the selected mesh between debug and re-export materials
-- **FS25 Material Settings** — edit shader parameters of the active material
-- **FS25 Debug View** — overlay masks or vertex colors on the active material for inspection
-- **FS25 Snow Heaps** — show or hide snow and icicle meshes
+After import, the **3D viewport sidebar** (press `N`) offers the
+**i3d Importer** tab with the workflow panels listed under
+[N-panel workflow tools](#n-panel-workflow-tools-n-in-the-3d-viewport-tab-i3d-importer).
 
 ## Round-trip via the Giants i3d Exporter
 
-The re-export materials are designed to round-trip cleanly through the official
-[Giants i3d Exporter](https://gdn.giants-software.com/downloads.php) for Blender. Two
-**optional** patches against the Giants exporter ship in the `patches/` folder, needed
-only if you want to re-export an imported `.i3d`. They fix two issues:
-1. ReferenceNodes cannot be re-exported out of the box. A small fix needs to be done to the Giants i3d Exporter for this to work. 
-2. The Giants i3d Exporter exports all materials with a white emissive map by default although there is none. This is only a wrong default and kann be fixed easily.
+The re-export materials are designed to round-trip cleanly through the
+official
+[Giants i3d Exporter](https://gdn.giants-software.com/downloads.php) for
+Blender. Two **optional** patches against the Giants exporter ship in
+[`blender_i3d_importer/patches/`](blender_i3d_importer/patches/) and fix
+the following issues in the exporter:
 
-See [`patches/README.md`](blender_i3d_importer/patches/README.md)
-for the manual application steps (not difficult, few-line edits in two files, described in detail).
+1. `KeyError: 'i3D_referenceChildPath'` on ReferenceNodes (most vehicles
+   and many buildings have these)
+2. Every re-exported material gets `emissiveColor="1 1 1 1"` even when
+   the original had none — a default-value bug in the exporter
+
+See
+[`blender_i3d_importer/patches/README.md`](blender_i3d_importer/patches/README.md)
+for application steps (a few-line edit in two files of the exporter,
+detailed instructions included).
+
+**Before re-export, remember:**
+
+- If you used the **Material Settings** sliders, click **Sync to Export
+  Material** so the changes are persisted on the export materials.
+- If you used the **Snow + Ice** or **Invisible GE-objects** hide
+  toggles, un-hide them — the Giants Exporter writes `visibility="false"`
+  to the XML based on the Outliner eye state.
+- If you used the **Material Switch** to Debug, switch back to Export
+  (debug materials carry extra preview nodes that are not
+  round-trip-clean).
 
 ## Known limitations
 
-- **Reference node recursion** — referenced sub-i3ds are not automatically loaded. They remain
-  as empty placeholders with the original `i3D_referenceFilename` custom property, which the
-  Giants exporter writes back correctly on re-export after you applied the fix in the patches (see above).
-- **Skin bindings** — meshes bound to multiple transform groups via `skinBindNodeIds` are
-  imported as info-only strings; skin animation is lost on re-export. Affects roughly 500
-  base-game vehicle implements. Not in scope for the current version due to limitations in the Exporter.
-- **Windows only** — the bundled extraction tool is a .NET 6 Windows binary. macOS and Linux
-  would require rebuilding the tool natively.
+- **Terrain is one-way.** The Giants Blender Exporter cannot emit a
+  `<TerrainTransformGroup>`. The terrain mesh is for in-Blender
+  preview / backgroundMesh-snapping only. The importer prints a
+  WARNING in the log when terrain is loaded.
+- **Reference-node recursion.** Sub-i3ds referenced by a node are not
+  loaded automatically; they remain as empties with the original
+  `i3D_referenceFilename` custom property. The Giants exporter writes
+  them back correctly on re-export, provided the
+  `referenceChildPath`-patch (see above) is applied.
+- **Joints** do not re-export to their original location in the scenegraph.
+  This is because in Blender, they need to be under an armature. 
+  I will create a LUA script to fix this in the Giants Editor.
 
 ## License and attribution
 
 - **This add-on** — GPL-3.0-or-later. See `LICENSE`.
-- **Bundled extraction tool** (`bin/i3dToObjx.exe`) — based on
-  [I3DShapesTool-OBJx](https://github.com/VidhosticeSDK/I3DShapesTool-OBJx) by VidhosticeSDK,
+- **`.i3d.shapes` decoder** — Python port of the C# logic from
+  [I3DShapesTool by Donkie](https://github.com/Donkie/I3DShapesTool),
   MIT-licensed. See `NOTICE` for the full attribution.
 
 ## Author
 
 Nadine Brinkmann — [YouTube](https://www.youtube.com/@Nadine-Brinkmann)
+
+If this add-on saves you time or unlocks a workflow you could not do
+before, a star on the repo or a comment on the channel is appreciated.
+You can also buy me a coffie: https://ko-fi.com/nadinebrinkmann

@@ -19,7 +19,45 @@ from typing import List, Dict, Optional, Tuple
 
 # Node kinds we take from the <Scene> subtree.
 # Everything else is skipped with a warning.
-VALID_KINDS = {'TransformGroup', 'Shape', 'Light', 'Camera', 'ReferenceNode'}
+# Tags that are valid scene-tree nodes (children of <Scene>).
+# TerrainTransformGroup is special: it's a leaf for our purposes — its XML
+# children (<OccluderLods>, <Layers>, ...) are NOT scene-tree nodes but
+# terrain-configuration sub-elements. _parse_node() does not recurse into
+# them; the importer reads them via node.raw_attrs / via separate lookup.
+VALID_KINDS = {'TransformGroup', 'Shape', 'Light', 'Camera', 'ReferenceNode',
+               'Note', 'TerrainTransformGroup'}
+
+# Kinds for which _parse_node() must NOT recurse into XML children, because
+# those children are configuration data (handled by the importer separately),
+# not scene-tree nodes.
+_LEAF_KINDS = {'TerrainTransformGroup'}
+
+
+@dataclass
+class I3DTerrainLayer:
+    """Ein einzelner Sub-Layer aus <Layers>/<Layer> innerhalb eines
+    <TerrainTransformGroup>-Knotens."""
+    name: str
+    detail_map_id:       Optional[int] = None
+    normal_map_id:       Optional[int] = None
+    height_map_id:       Optional[int] = None
+    displacement_map_id: Optional[int] = None
+    weight_map_id:       Optional[int] = None
+    unit_size:               float = 2.0    # tiling scale (m)
+    displacement_max_height: float = 0.25
+    blend_contrast:          float = 0.2
+    raw_attrs: Dict[str, str] = field(default_factory=dict)  # Physik etc.
+
+
+@dataclass
+class I3DCombinedLayer:
+    """Ein CombinedLayer aus <Layers>/<CombinedLayer>: kombiniert genau zwei
+    Sub-Layer (z.B. 'asphalt01;asphalt02') ueber noise-basiertes Variant-
+    Blending."""
+    name: str
+    sub_layer_names: List[str]     # gesplittet aus "asphalt01;asphalt02"
+    noise_frequency: float = 2.0
+    raw_attrs: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -35,6 +73,12 @@ class I3DSceneNode:
     materialIds: List[int] = field(default_factory=list)    # only for Shape
     children:    List['I3DSceneNode'] = field(default_factory=list)
     raw_attrs:   Dict[str, str] = field(default_factory=dict)  # everything else (for C.4)
+    # Terrain-only: <Layers>-Sub-Element von <TerrainTransformGroup>.
+    # Leer fuer alle anderen Node-Kinds. _parse_node fuellt diese fuer
+    # TerrainTransformGroup-Knoten, _LEAF_KINDS verhindert dass die XML-
+    # Kinder als Scene-Tree gelesen werden, deshalb hier separat.
+    terrain_layers:          List['I3DTerrainLayer']  = field(default_factory=list)
+    terrain_combined_layers: List['I3DCombinedLayer'] = field(default_factory=list)
 
 
 @dataclass
@@ -53,6 +97,11 @@ class I3DScene:
     # If has_inline_shapes is True, mesh data is embedded in the XML directly
     # and external_shapes_file is None. Importer does not support this
     # (will abort or warn).
+
+    user_attributes: Dict[int, List[Tuple[str, str, str]]] = field(default_factory=dict)
+    # nodeId -> list of (name, type, value_str) tuples from <UserAttributes>.
+    # type is one of: boolean, integer, float, string, scriptCallback.
+    # value_str is the raw XML value; conversion happens in the importer.
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +200,29 @@ def parse_i3d(filepath: Path) -> I3DScene:
             if node is not None:
                 scene.roots.append(node)
 
+    # <UserAttributes> sits at root level, after <Scene>. Each <UserAttribute
+    # nodeId="N"> contains one or more <Attribute name="X" type="Y" value="Z"/>.
+    user_attrs_elem = root.find('UserAttributes')
+    if user_attrs_elem is not None:
+        for ua in user_attrs_elem.findall('UserAttribute'):
+            nid_str = ua.get('nodeId')
+            if nid_str is None:
+                continue
+            try:
+                nid = int(nid_str)
+            except ValueError:
+                continue
+            attrs = []
+            for a in ua.findall('Attribute'):
+                a_name = a.get('name')
+                a_type = a.get('type')
+                a_value = a.get('value')
+                if a_name is None or a_type is None or a_value is None:
+                    continue
+                attrs.append((a_name, a_type, a_value))
+            if attrs:
+                scene.user_attributes[nid] = attrs
+
     return scene
 
 
@@ -195,10 +267,26 @@ def _parse_node(elem: ET.Element) -> Optional[I3DSceneNode]:
         raw_attrs   = raw_attrs,
     )
 
-    for child in elem:
-        child_node = _parse_node(child)
-        if child_node is not None:
-            node.children.append(child_node)
+    # TerrainTransformGroup-spezifisch: <Layers>-Sub-Element extrahieren.
+    # _LEAF_KINDS verhindert dass das als Scene-Tree gelesen wird, deshalb
+    # hier explizit. <CombinedOverlayLayer> erstmal ausgeklammert (groundDetail-
+    # Overlays - kommen ggf. spaeter, nicht im PoC-Scope).
+    if kind == 'TerrainTransformGroup':
+        layers_elem = elem.find('Layers')
+        if layers_elem is not None:
+            for layer_elem in layers_elem.findall('Layer'):
+                node.terrain_layers.append(_parse_terrain_layer(layer_elem))
+            for combined_elem in layers_elem.findall('CombinedLayer'):
+                node.terrain_combined_layers.append(_parse_combined_layer(combined_elem))
+
+    # Leaf kinds (e.g. TerrainTransformGroup) do not recurse — their XML
+    # children are config sub-elements (OccluderLods/Layers/...), handled
+    # by the importer separately, not part of the scene tree.
+    if kind not in _LEAF_KINDS:
+        for child in elem:
+            child_node = _parse_node(child)
+            if child_node is not None:
+                node.children.append(child_node)
 
     return node
 
@@ -207,7 +295,7 @@ def _parse_node(elem: ET.Element) -> Optional[I3DSceneNode]:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _parse_vec3(s: Optional[str], default: Tuple[float, float, float]) -> Tuple[float, float, float]:
+def _parse_vec3(s, default):
     """'x y z' -> (x,y,z); s empty/None/invalid -> default."""
     if not s:
         return default
@@ -220,11 +308,53 @@ def _parse_vec3(s: Optional[str], default: Tuple[float, float, float]) -> Tuple[
         return default
 
 
-def _to_int(s, default):
-    """Safe int parsing with default."""
+def _to_int(s, default=0):
     if s is None:
         return default
     try:
-        return int(s)
+        return int(str(s).strip(), 0)
     except (ValueError, TypeError):
         return default
+
+
+def _to_float(s, default):
+    if s is None:
+        return default
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_terrain_layer(elem: ET.Element) -> I3DTerrainLayer:
+    """Parst ein einzelnes <Layer>-Element aus <TerrainTransformGroup>/<Layers>."""
+    a = elem.attrib
+    consumed = {'name', 'detailMapId', 'normalMapId', 'heightMapId',
+                'displacementMapId', 'weightMapId', 'unitSize',
+                'displacementMaxHeight', 'blendContrast'}
+    return I3DTerrainLayer(
+        name                    = a.get('name', ''),
+        detail_map_id           = _to_int(a.get('detailMapId'),       default=None),
+        normal_map_id           = _to_int(a.get('normalMapId'),       default=None),
+        height_map_id           = _to_int(a.get('heightMapId'),       default=None),
+        displacement_map_id     = _to_int(a.get('displacementMapId'), default=None),
+        weight_map_id           = _to_int(a.get('weightMapId'),       default=None),
+        unit_size               = _to_float(a.get('unitSize'),               2.0),
+        displacement_max_height = _to_float(a.get('displacementMaxHeight'),  0.25),
+        blend_contrast          = _to_float(a.get('blendContrast'),          0.2),
+        raw_attrs               = {k: v for k, v in a.items() if k not in consumed},
+    )
+
+
+def _parse_combined_layer(elem: ET.Element) -> I3DCombinedLayer:
+    """Parst ein einzelnes <CombinedLayer>-Element aus <TerrainTransformGroup>/<Layers>."""
+    a = elem.attrib
+    consumed = {'name', 'layers', 'noiseFrequency'}
+    layers_str = a.get('layers', '')
+    sub_names = [s.strip() for s in layers_str.split(';') if s.strip()]
+    return I3DCombinedLayer(
+        name             = a.get('name', ''),
+        sub_layer_names  = sub_names,
+        noise_frequency  = _to_float(a.get('noiseFrequency'), 2.0),
+        raw_attrs        = {k: v for k, v in a.items() if k not in consumed},
+    )

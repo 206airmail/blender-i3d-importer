@@ -263,7 +263,8 @@ def _ensure_param_frame(nt):
 
 
 def _make_param_value(nt, param_name, default_value, location,
-                      label=None, target_input=None):
+                      label=None, target_input=None,
+                      xml_param=None, xml_slot=None):
     """Labeled Value node for a single FS25 custom-parameter scalar.
 
     Marker: node.name = f"fs25_param:{param_name}" so the N-Panel can find
@@ -276,13 +277,24 @@ def _make_param_value(nt, param_name, default_value, location,
     node.outputs[0].default_value = float(default_value)
     node.location = location
     node.parent = _ensure_param_frame(nt)
+    # Serialize hint for FS25_OT_sync_debug_to_export_material:
+    # the slider value goes back to the customParameter_* IDProperty
+    # as a plain float string.
+    node['fs25_serialize'] = 'float'
+    # Sync grouping hints. xml_param = the XML <CustomParameter name>;
+    # xml_slot = which slice of its value this slider drives ('all'
+    # for non-split, 'rgb'/'w'/'x'/'y'/'z'/'alpha' for split). Defaults
+    # mean: this slider equals the whole XML param.
+    node['fs25_xml_param'] = xml_param if xml_param is not None else param_name
+    node['fs25_xml_slot'] = xml_slot if xml_slot is not None else 'all'
     if target_input is not None:
         nt.links.new(node.outputs[0], target_input)
     return node
 
 
 def _make_param_rgb(nt, param_name, default_rgba, location,
-                    label=None, target_input=None):
+                    label=None, target_input=None,
+                    xml_param=None, xml_slot=None):
     """Labeled RGB node for an FS25 custom-parameter color (3 or 4 floats).
 
     If only 3 components are given, alpha defaults to 1.0.
@@ -298,6 +310,13 @@ def _make_param_rgb(nt, param_name, default_rgba, location,
     node.outputs[0].default_value = rgba
     node.location = location
     node.parent = _ensure_param_frame(nt)
+    # Serialize hint for FS25_OT_sync_debug_to_export_material:
+    # the slider value goes back to the customParameter_* IDProperty
+    # as 4 space-separated floats 'r g b a'.
+    node['fs25_serialize'] = 'rgba'
+    # Sync grouping hints (see _make_param_value for details).
+    node['fs25_xml_param'] = xml_param if xml_param is not None else param_name
+    node['fs25_xml_slot'] = xml_slot if xml_slot is not None else 'all'
     if target_input is not None:
         nt.links.new(node.outputs[0], target_input)
     return node
@@ -309,6 +328,12 @@ def _make_param_value_inverted(nt, param_name, default_value, location,
     Coat Roughness (Roughness = 1 - Smoothness). The slider exposes the
     i3d semantic (smoothness)."""
     val = _make_param_value(nt, param_name, default_value, location, label)
+    # The slider exposes the i3d-semantic value (e.g. smoothness),
+    # but the shader uses 1-x internally (e.g. coat roughness).
+    # Override the serialize hint set by _make_param_value to reflect
+    # that the customParameter_* value is the slider value AS-IS
+    # (NOT 1-x); the in-shader inversion is purely a visualization.
+    val['fs25_serialize'] = 'float'
     sub = nt.nodes.new('ShaderNodeMath')
     sub.operation = 'SUBTRACT'
     sub.inputs[0].default_value = 1.0
@@ -770,6 +795,13 @@ def build_pbr_debug_material(
     mat['_i3d_material_kind'] = 'debug'
     mat['_i3d_debug_pbr_for'] = mat_name
     mat['_i3d_debug_pbr_variation'] = mat_attrs.get('customShaderVariation', '') or ''
+    # Stamp the current import's UUID so the switch operator can pair this
+    # debug material with its export counterpart from the same import even
+    # when multiple imports share material_id 0/1/2/...
+    # Late-import importer here to avoid circular import at module load.
+    from . import importer as _imp
+    if _imp._CURRENT_IMPORT_UUID is not None:
+        mat['_i3d_import_uuid'] = _imp._CURRENT_IMPORT_UUID
 
     nt = mat.node_tree
     bsdf = nt.nodes.get('Principled BSDF')
@@ -1178,6 +1210,7 @@ def build_pbr_debug_material(
                 nt, "dirtMossMix_x", moss_intensity,
                 location=(60, -480), label="Moss Intensity",
                 target_input=moss_grp.inputs['MossIntensity'],
+                xml_param="dirtMossMix", xml_slot="x",
             )
             # MossTint input only present in extended snippets.
             if 'MossTint' in moss_grp.inputs:
@@ -1185,6 +1218,7 @@ def build_pbr_debug_material(
                     nt, "dirtMossTint_y", moss_tint,
                     location=(60, -560), label="Moss Tint",
                     target_input=moss_grp.inputs['MossTint'],
+                    xml_param="dirtMossTint", xml_slot="y",
                 )
             base_color_source = moss_grp.outputs['BaseColor']
             composited_features.append('Moss')
@@ -1205,12 +1239,14 @@ def build_pbr_debug_material(
                 nt, "dirtMossMix_y", dirt_intensity,
                 location=(260, -480), label="Dirt Intensity",
                 target_input=dirt_grp.inputs['DirtIntensity'],
+                xml_param="dirtMossMix", xml_slot="y",
             )
             if 'DirtTint' in dirt_grp.inputs:
                 _make_param_value(
                     nt, "dirtMossTint_x", dirt_tint,
                     location=(260, -560), label="Dirt Tint",
                     target_input=dirt_grp.inputs['DirtTint'],
+                    xml_param="dirtMossTint", xml_slot="x",
                 )
             base_color_source = dirt_grp.outputs['BaseColor']
             composited_features.append('Dirt')
@@ -1499,16 +1535,19 @@ def build_pbr_debug_material(
             nt.links.new(gm_node.outputs['Color'], masks_grp.inputs['GlossMap'])
             _make_param_value(
                 nt, "scratches_dirt_snow_wetness_x", sa,
+                xml_param="scratches_dirt_snow_wetness", xml_slot="x",
                 location=(60, -1950), label="Scratches Amount",
                 target_input=masks_grp.inputs['ScratchesAmount'],
             )
             _make_param_value(
                 nt, "scratches_dirt_snow_wetness_y", da,
+                xml_param="scratches_dirt_snow_wetness", xml_slot="y",
                 location=(60, -2030), label="Dirt Amount",
                 target_input=masks_grp.inputs['DirtAmount'],
             )
             _make_param_value(
                 nt, "scratches_dirt_snow_wetness_z", sna,
+                xml_param="scratches_dirt_snow_wetness", xml_slot="z",
                 location=(60, -2110), label="Snow Amount",
                 target_input=masks_grp.inputs['SnowAmount'],
             )
@@ -1824,11 +1863,13 @@ def build_pbr_debug_material(
                 nt.links.new(base_color_source, tint_grp.inputs['BaseColor'])
                 _make_param_rgb(
                     nt, "placeableColorScale_rgb", (tint_r, tint_g, tint_b),
+                    xml_param="placeableColorScale", xml_slot="rgb",
                     location=(900, 50), label="Placeable Color (tint)",
                     target_input=tint_grp.inputs['TintColor'],
                 )
                 _make_param_value(
                     nt, "placeableColorScale_w", blend_factor,
+                    xml_param="placeableColorScale", xml_slot="w",
                     location=(900, -30), label="Placeable Blend Factor",
                     target_input=tint_grp.inputs['BlendFactor'],
                 )
@@ -1887,6 +1928,7 @@ def build_pbr_debug_material(
                         location=(1080, -200 - i * 80),
                         label=f"ColorMultitint Slot {i} Tint",
                         target_input=tc,
+                        xml_param=f"colorScale{i}", xml_slot="rgb",
                     )
                 if bf is not None:
                     _make_param_value(
@@ -1894,6 +1936,7 @@ def build_pbr_debug_material(
                         location=(1080, -240 - i * 80),
                         label=f"ColorMultitint Slot {i} Blend",
                         target_input=bf,
+                        xml_param=f"colorScale{i}", xml_slot="w",
                     )
 
             # contrastLuminiosity: pass to MaskContrast/MaskLuminosity 
@@ -1916,12 +1959,14 @@ def build_pbr_debug_material(
                             nt, "contrastLuminiosity_x", contrast,
                             location=(1080, -900), label="Mask Contrast",
                             target_input=mc,
+                            xml_param="contrastLuminiosity", xml_slot="x",
                         )
                     if ml is not None:
                         _make_param_value(
                             nt, "contrastLuminiosity_y", luminosity,
                             location=(1080, -980), label="Mask Luminosity",
                             target_input=ml,
+                            xml_param="contrastLuminiosity", xml_slot="y",
                         )
                 mat['_i3d_pbr_contrastLuminiosity'] = str(cl)
 
@@ -1997,6 +2042,7 @@ def build_pbr_debug_material(
                         location=(1280, -200 - i * 80),
                         label=f"BuildingMultitint Slot {i} Tint",
                         target_input=tc,
+                        xml_param=f"colorScale{i}", xml_slot="rgb",
                     )
                 if bf is not None:
                     _make_param_value(
@@ -2004,6 +2050,7 @@ def build_pbr_debug_material(
                         location=(1280, -240 - i * 80),
                         label=f"BuildingMultitint Slot {i} Blend",
                         target_input=bf,
+                        xml_param=f"colorScale{i}", xml_slot="w",
                     )
 
             nt.links.new(base_color_source, bm_grp.inputs['BaseColor'])
