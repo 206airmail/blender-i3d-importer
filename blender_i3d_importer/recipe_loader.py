@@ -743,6 +743,142 @@ def apply_debug_mode_to_material(mat, mode_str):
 # Main API: build PBR debug material
 # ---------------------------------------------------------------------------
 
+def _build_colormat_palette_image(mat_name, custom_params):
+    """Build an 8x1 lookup image from the FS22 vehicleShader colorMat0..7 palette.
+
+    Pixel i = colorMat[i] RGB (paint colour, stored linear -> Non-Color image so
+    the value reaches Base Color unchanged; i3d colours are linear) plus
+    alpha = colorMat[i].w / 255 (the Giants material-library index, consumed by
+    the detail-array pass). Missing entries default to mid-grey.
+    """
+    import bpy as _bpy
+    img = _bpy.data.images.new(f"{mat_name}_colorMat", width=8, height=1, alpha=True)
+    img.colorspace_settings.name = 'Non-Color'
+    px = []
+    for i in range(8):
+        raw = custom_params.get(f'colorMat{i}')
+        r = g = b = 0.5
+        w = 0.0
+        if raw:
+            parts = str(raw).split()
+            try:
+                r, g, b = float(parts[0]), float(parts[1]), float(parts[2])
+                w = float(parts[3]) if len(parts) > 3 else 0.0
+            except (ValueError, IndexError):
+                r = g = b = 0.5
+                w = 0.0
+        px.extend((r, g, b, min(1.0, max(0.0, w / 255.0))))
+    img.pixels = px
+    img.pack()
+    return img
+
+
+_DETAIL_ATLAS_CACHE = {}
+
+
+def _decode_bc1_array_mip0(dds_bytes):
+    """Decode a DX10 BC1 2D-array DDS (all layers, mip0) -> (list[(h,w,3) uint8], w, h).
+    Verified against the FS22 detailArray_*.dds files. numpy is bundled with Blender.
+    Returns (None, 0, 0) if the file is not a BC1 DX10 array."""
+    import struct
+    import numpy as np
+    d = dds_bytes
+    if d[:4] != b'DDS ' or d[84:88] != b'DX10':
+        return None, 0, 0
+    h = struct.unpack_from('<I', d, 12)[0]
+    w = struct.unpack_from('<I', d, 16)[0]
+    mips = struct.unpack_from('<I', d, 28)[0] or 1
+    dxgi = struct.unpack_from('<I', d, 128)[0]
+    arr = struct.unpack_from('<I', d, 140)[0] or 1
+    if dxgi not in (71, 72):  # BC1_UNORM / BC1_UNORM_SRGB
+        return None, 0, 0
+
+    def mb(ww, hh):
+        return max(1, ww // 4) * max(1, hh // 4) * 8
+
+    slice_bytes = 0
+    ww, hh = w, h
+    for _ in range(mips):
+        slice_bytes += mb(ww, hh)
+        ww = max(1, ww // 2)
+        hh = max(1, hh // 2)
+    bw, bh = w // 4, h // 4
+
+    def decode_mip0(buf):
+        blk = np.frombuffer(buf[:bw * bh * 8], np.uint8).reshape(bw * bh, 8)
+        c0 = blk[:, 0].astype(np.uint16) | (blk[:, 1].astype(np.uint16) << 8)
+        c1 = blk[:, 2].astype(np.uint16) | (blk[:, 3].astype(np.uint16) << 8)
+        idx = (blk[:, 4].astype(np.uint32) | (blk[:, 5].astype(np.uint32) << 8)
+               | (blk[:, 6].astype(np.uint32) << 16) | (blk[:, 7].astype(np.uint32) << 24))
+
+        def to888(c):
+            r = (c >> 11) & 0x1f
+            g = (c >> 5) & 0x3f
+            b = c & 0x1f
+            return np.stack([r * 255 // 31, g * 255 // 63, b * 255 // 31], -1).astype(np.uint16)
+
+        a = to888(c0)
+        b = to888(c1)
+        gt = (c0 > c1)[:, None]
+        c2 = np.where(gt, (2 * a + b) // 3, (a + b) // 2)
+        c3 = np.where(gt, (a + 2 * b) // 3, np.zeros_like(a))
+        pal = np.stack([a, b, c2, c3], 1).astype(np.uint8)
+        n = bw * bh
+        sel = np.stack([(idx >> (2 * pp)) & 3 for pp in range(16)], -1)
+        px = pal[np.arange(n)[:, None], sel].reshape(n, 4, 4, 3)
+        return px.reshape(bh, bw, 4, 4, 3).transpose(0, 2, 1, 3, 4).reshape(bh * 4, bw * 4, 3)
+
+    data_off = 148
+    layers = [decode_mip0(d[data_off + s * slice_bytes:data_off + s * slice_bytes + mb(w, h)])
+              for s in range(arr)]
+    return layers, w, h
+
+
+def _get_detail_diffuse_atlas(i3d_dir, resolve_filepath, report):
+    """Decode the mArrayDiffuse detail array (Giants material library) into a
+    cached 8-column Blender atlas image (256 px/tile, sRGB). Tile (col,row) =
+    library layer row*8+col, oriented bottom-up so model UV (floor(u),floor(v))
+    maps straight onto it. Returns (image, row_count) or None."""
+    import os
+    import bpy as _bpy
+    import numpy as np
+    path = resolve_filepath('$data/shared/detailArray_diffuse.dds', i3d_dir)
+    if not path or not os.path.exists(path):
+        return None
+    cached = _DETAIL_ATLAS_CACHE.get(path)
+    if cached is not None:
+        img, rows = cached
+        if img is not None and img.name in _bpy.data.images:
+            return cached
+    try:
+        with open(path, 'rb') as fh:
+            layers, w, h = _decode_bc1_array_mip0(fh.read())
+    except Exception as e:
+        report('WARNING', f"detailArray_diffuse decode failed: {type(e).__name__}: {e}")
+        _DETAIL_ATLAS_CACHE[path] = None
+        return None
+    if not layers:
+        _DETAIL_ATLAS_CACHE[path] = None
+        return None
+    COLS, T = 8, 256
+    rows = (len(layers) + COLS - 1) // COLS
+    atlas = np.zeros((rows * T, COLS * T, 4), np.float32)
+    atlas[:, :, 3] = 1.0
+    sh = max(1, h // T)
+    sw = max(1, w // T)
+    for L, tile in enumerate(layers):
+        col = L % COLS
+        row = L // COLS
+        ds = tile[::sh, ::sw][:T, :T].astype(np.float32) / 255.0
+        atlas[row * T:(row + 1) * T, col * T:(col + 1) * T, :3] = np.flipud(ds)
+    img = _bpy.data.images.new('FS_detailArray_diffuse', width=COLS * T, height=rows * T, alpha=True)
+    img.colorspace_settings.name = 'sRGB'
+    img.pixels.foreach_set(np.ascontiguousarray(atlas).ravel())
+    img.pack()
+    _DETAIL_ATLAS_CACHE[path] = (img, rows)
+    return (img, rows)
+
+
 def build_pbr_debug_material(
     mat_name: str,
     mat_attrs: dict,
@@ -1154,6 +1290,115 @@ def build_pbr_debug_material(
     custom_params = {cp['name']: cp['value']
                      for cp in mat_attrs.get('_customparameters', [])
                      if cp.get('name') and cp.get('value') is not None}
+
+    # ---- 6b. FS22 vehicleShader colorMask palette (Teil 1) ----------------
+    # FS22 vehicles have no diffuse <Texture>; the base colour comes from the
+    # colorMat0..7 palette selected per-fragment by UV0: when uv.y < 0 the colour
+    # is colorMat[floor(uv.x)] (fixes FS22 white vehicle materials). uv.y >= 0
+    # regions use the Giants material-library detail array (handled in 6c).
+    # cm_* refs are stashed for the detail-array pass.
+    cm_palette_u = cm_is_palette = cm_mat_index = cm_uv_sep = cm_base_mix = None
+    _cm_variation = mat_attrs.get('customShaderVariation', '') or ''
+    if _tp_shader_name == 'vehicleshader.xml' and 'colorMask' in _cm_variation:
+        _pal_img = _build_colormat_palette_image(mat_name, custom_params)
+        _cm_uv = nt.nodes.new('ShaderNodeUVMap')
+        _cm_uv.uv_map = 'UVMap'
+        _cm_uv.location = (-1900, 700)
+        cm_uv_sep = nt.nodes.new('ShaderNodeSeparateXYZ')
+        cm_uv_sep.location = (-1700, 700)
+        nt.links.new(_cm_uv.outputs['UV'], cm_uv_sep.inputs['Vector'])
+        # palette_u = (floor(U) + 0.5) / 8
+        _f = nt.nodes.new('ShaderNodeMath'); _f.operation = 'FLOOR'
+        _f.location = (-1500, 800)
+        nt.links.new(cm_uv_sep.outputs['X'], _f.inputs[0])
+        _a = nt.nodes.new('ShaderNodeMath'); _a.operation = 'ADD'
+        _a.inputs[1].default_value = 0.5; _a.location = (-1320, 800)
+        nt.links.new(_f.outputs[0], _a.inputs[0])
+        _d = nt.nodes.new('ShaderNodeMath'); _d.operation = 'DIVIDE'
+        _d.inputs[1].default_value = 8.0; _d.location = (-1140, 800)
+        nt.links.new(_a.outputs[0], _d.inputs[0])
+        cm_palette_u = _d.outputs[0]
+        _comb = nt.nodes.new('ShaderNodeCombineXYZ')
+        _comb.inputs['Y'].default_value = 0.5; _comb.location = (-950, 800)
+        nt.links.new(cm_palette_u, _comb.inputs['X'])
+        _pal_tex = nt.nodes.new('ShaderNodeTexImage')
+        _pal_tex.image = _pal_img
+        _pal_tex.interpolation = 'Closest'
+        _pal_tex.extension = 'EXTEND'
+        _pal_tex.location = (-750, 800)
+        nt.links.new(_comb.outputs['Vector'], _pal_tex.inputs['Vector'])
+        cm_mat_index = _pal_tex.outputs['Alpha']  # material-library index / 255
+        # is_palette = (uv.y < 0)
+        _lt = nt.nodes.new('ShaderNodeMath'); _lt.operation = 'LESS_THAN'
+        _lt.inputs[1].default_value = 0.0; _lt.location = (-1140, 560)
+        nt.links.new(cm_uv_sep.outputs['Y'], _lt.inputs[0])
+        cm_is_palette = _lt.outputs[0]
+        # base colour: mix(grey placeholder, palette, is_palette).
+        # The detail-array pass (6c) replaces the grey for uv.y >= 0 regions.
+        _cm_mix = nt.nodes.new('ShaderNodeMix'); _cm_mix.data_type = 'RGBA'
+        _cm_mix.location = (-500, 760); _cm_mix.label = 'colorMask palette'
+        _cm_mix.inputs[6].default_value = (0.5, 0.5, 0.5, 1.0)
+        nt.links.new(_pal_tex.outputs['Color'], _cm_mix.inputs[7])
+        nt.links.new(cm_is_palette, _cm_mix.inputs['Factor'])
+        base_color_source = _cm_mix.outputs[2]
+        cm_base_mix = _cm_mix
+        composited_features.append('colorMask')
+
+    # ---- 6c. FS22 detail-array albedo for uv.y>=0 (Teil 2) ----------------
+    # uv.y>=0 regions carry no diffuse texture; their albedo is the Giants
+    # material-library tile mArrayDiffuse[floor(v)*8 + floor(u)]. Sample a decoded
+    # atlas of that array and feed it into the colorMask base mix, replacing the
+    # grey placeholder for the non-painted regions. Normal/spec stay as handled
+    # by the material's own normal map + vmask (shader-internal combine not
+    # reconstructable from the XML).
+    if cm_base_mix is not None:
+        _atlas = _get_detail_diffuse_atlas(i3d_dir, resolve_filepath, report)
+        if _atlas is not None:
+            _atlas_img, _atlas_rows = _atlas
+            _COLS = 8
+            _fu = nt.nodes.new('ShaderNodeMath'); _fu.operation = 'FLOOR'
+            _fu.location = (-1500, 300)
+            nt.links.new(cm_uv_sep.outputs['X'], _fu.inputs[0])
+            _cu = nt.nodes.new('ShaderNodeClamp'); _cu.location = (-1320, 300)
+            _cu.inputs['Min'].default_value = 0.0
+            _cu.inputs['Max'].default_value = float(_COLS - 1)
+            nt.links.new(_fu.outputs[0], _cu.inputs['Value'])
+            _fv = nt.nodes.new('ShaderNodeMath'); _fv.operation = 'FLOOR'
+            _fv.location = (-1500, 120)
+            nt.links.new(cm_uv_sep.outputs['Y'], _fv.inputs[0])
+            _cv = nt.nodes.new('ShaderNodeClamp'); _cv.location = (-1320, 120)
+            _cv.inputs['Min'].default_value = 0.0
+            _cv.inputs['Max'].default_value = float(_atlas_rows - 1)
+            nt.links.new(_fv.outputs[0], _cv.inputs['Value'])
+            _ru = nt.nodes.new('ShaderNodeMath'); _ru.operation = 'FRACT'
+            _ru.location = (-1320, 460)
+            nt.links.new(cm_uv_sep.outputs['X'], _ru.inputs[0])
+            _rv = nt.nodes.new('ShaderNodeMath'); _rv.operation = 'FRACT'
+            _rv.location = (-1320, -40)
+            nt.links.new(cm_uv_sep.outputs['Y'], _rv.inputs[0])
+            _aua = nt.nodes.new('ShaderNodeMath'); _aua.operation = 'ADD'
+            _aua.location = (-1140, 380)
+            nt.links.new(_cu.outputs[0], _aua.inputs[0])
+            nt.links.new(_ru.outputs[0], _aua.inputs[1])
+            _au = nt.nodes.new('ShaderNodeMath'); _au.operation = 'DIVIDE'
+            _au.inputs[1].default_value = float(_COLS); _au.location = (-960, 380)
+            nt.links.new(_aua.outputs[0], _au.inputs[0])
+            _ava = nt.nodes.new('ShaderNodeMath'); _ava.operation = 'ADD'
+            _ava.location = (-1140, 80)
+            nt.links.new(_cv.outputs[0], _ava.inputs[0])
+            nt.links.new(_rv.outputs[0], _ava.inputs[1])
+            _av = nt.nodes.new('ShaderNodeMath'); _av.operation = 'DIVIDE'
+            _av.inputs[1].default_value = float(_atlas_rows); _av.location = (-960, 80)
+            nt.links.new(_ava.outputs[0], _av.inputs[0])
+            _acomb = nt.nodes.new('ShaderNodeCombineXYZ'); _acomb.location = (-780, 240)
+            nt.links.new(_au.outputs[0], _acomb.inputs['X'])
+            nt.links.new(_av.outputs[0], _acomb.inputs['Y'])
+            _atex = nt.nodes.new('ShaderNodeTexImage'); _atex.image = _atlas_img
+            _atex.interpolation = 'Linear'; _atex.extension = 'EXTEND'
+            _atex.location = (-560, 240)
+            nt.links.new(_acomb.outputs['Vector'], _atex.inputs['Vector'])
+            nt.links.new(_atex.outputs['Color'], cm_base_mix.inputs[6])
+            composited_features.append('detailArrayDiffuse')
 
     mask_tex     = cm_tex.get('mMaskMap')
     dirt_tex     = cm_tex.get('mDirtDiffuse')
