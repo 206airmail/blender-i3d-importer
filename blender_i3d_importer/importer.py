@@ -593,6 +593,25 @@ def _create_mesh_object(node, scene, mesh_cache, material_cache, image_cache,
     return obj
 
 
+def _apply_custom_split_normals(mesh, vertex_normals):
+    """Apply i3d per-vertex normals as Blender custom split normals.
+
+    Without this, Blender falls back to flat per-face normals and the mesh
+    looks blocky (GitHub #1, #7). Faces are set smooth so the custom corner
+    normals are respected; the explicit normals reproduce the baked GE look
+    (soft surfaces + hard edges) and survive re-export.
+
+    vertex_normals: list of (x, y, z), one per mesh vertex (local order).
+    No-op if absent or the count does not match the vertex count.
+    """
+    if not vertex_normals or len(vertex_normals) != len(mesh.vertices):
+        return False
+    if mesh.polygons:
+        mesh.polygons.foreach_set('use_smooth', [True] * len(mesh.polygons))
+    mesh.normals_split_custom_set_from_vertices(vertex_normals)
+    return True
+
+
 def _build_mesh_datablock(shape, datablock_name, node, scene, material_cache,
                           image_cache, shader_cache, i3d_dir, report):
     """Convert a decoded Shape into a Blender mesh datablock + assign materials."""
@@ -660,6 +679,9 @@ def _build_mesh_datablock(shape, datablock_name, node, scene, material_cache,
             if poly_idx >= n_polys:
                 break
             mesh.polygons[poly_idx].material_index = min(subset_idx, max_slot)
+
+    # Custom split normals from the i3d (GitHub #1/#7: avoid blocky look).
+    _apply_custom_split_normals(mesh, md.normals)
 
     return mesh
 
@@ -2201,6 +2223,13 @@ def _process_merge_children(import_collection, shape_map, shape_id_to_obj, repor
                         global_v = vert_idxs[loop.vertex_index]
                         c = shape.vertex_colors[global_v]
                         color_layer.data[loop_idx].color = (c.x, c.y, c.z, c.w)
+            # Custom split normals (GitHub #1/#7), remapped to local verts.
+            if shape.normals is not None:
+                _apply_custom_split_normals(
+                    mdb,
+                    [(shape.normals[g].x, shape.normals[g].y, shape.normals[g].z)
+                     for g in vert_idxs],
+                )
             return mdb
 
         # ---- Convert the mesh_obj to an Empty (TransformGroup) ----
@@ -2725,6 +2754,13 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
                         c = shape.vertex_colors[global_v]
                         color_layer.data[loop_idx].color = (c.x, c.y, c.z, c.w)
 
+            # Custom split normals (GitHub #1/#7), remapped to local verts.
+            if shape.normals is not None:
+                _apply_custom_split_normals(
+                    mdb,
+                    [(shape.normals[g].x, shape.normals[g].y, shape.normals[g].z)
+                     for g in slot_vert_indices],
+                )
             return mdb
 
         # -------- Slot 0: replace root_obj's mesh with the slot-0 sub-mesh --------
