@@ -1571,6 +1571,13 @@ def build_pbr_debug_material(
             )
 
             # BaseColor: snow → dirt → scratches (sequential mix multiplies)
+            # Dirt textures below are assigned inside this base-color block but
+            # are also read by the roughness/metallic/normal blocks further down.
+            # Pre-init so a material whose base_color_source is None does not
+            # raise UnboundLocalError (FS22 vehicle debug materials).
+            dirt_norm_tex = None
+            dirt_spec_tex_def = None
+
             if base_color_source is not None:
                 m_snow = nt.nodes.new('ShaderNodeMix')
                 m_snow.data_type = 'RGBA'
