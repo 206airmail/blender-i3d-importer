@@ -624,6 +624,19 @@ def _build_mesh_datablock(shape, datablock_name, node, scene, material_cache,
 
     mesh = bpy.data.meshes.new(name=datablock_name)
     face_v_indices = [tuple(idx[0] for idx in face) for face in md.faces]
+    # Pre-scan for degenerate faces so we can log at the right level.
+    # Duplicate verts (zero-area faces) are common in source files and
+    # expected; out-of-range indices indicate a real decoder problem.
+    _nv = len(md.vertices)
+    _dup = sum(1 for fv in face_v_indices if len(set(fv)) < len(fv))
+    _oor = sum(1 for fv in face_v_indices
+               if len(set(fv)) == len(fv) and any(i < 0 or i >= _nv for i in fv))
+    if _dup:
+        report('INFO', f"Mesh '{datablock_name}': {_dup} zero-area face(s) removed "
+                        f"(degenerate triangles in source file, normal behaviour).")
+    if _oor:
+        report('WARNING', f"Mesh '{datablock_name}': {_oor} face(s) with out-of-range "
+                           f"vertex indices removed — possible decoder error.")
     mesh.from_pydata(md.vertices, [], face_v_indices)
     mesh.update(calc_edges=True)
 
@@ -685,6 +698,12 @@ def _build_mesh_datablock(shape, datablock_name, node, scene, material_cache,
                 break
             mesh.polygons[poly_idx].material_index = min(subset_idx, max_slot)
 
+    # validate() after UV/color/material setup: removes degenerate geometry
+    # (zero-area faces, out-of-range indices) that would cause a Blender
+    # crash in normals_split_custom_set_from_vertices or an Edit Mode freeze.
+    # Must come AFTER UV/color assignment (validate may remove faces,
+    # reducing loop count) and BEFORE custom normals (needs clean mesh).
+    mesh.validate(clean_customdata=False)  # logging done above via pre-scan
     # Custom split normals from the i3d (GitHub #1/#7: avoid blocky look).
     _apply_custom_split_normals(mesh, md.normals)
 
@@ -2194,7 +2213,17 @@ def _process_merge_children(import_collection, shape_map, shape_id_to_obj, repor
             verts = [(shape.positions[i].x, shape.positions[i].y, shape.positions[i].z)
                      for i in vert_idxs]
             mdb = _bpy.data.meshes.new(name=name)
+            _nv = len(verts)
+            _dup = sum(1 for fv in tris if len(set(fv)) < len(fv))
+            _oor = sum(1 for fv in tris if len(set(fv)) == len(fv) and any(i < 0 or i >= _nv for i in fv))
+            if _dup:
+                report('INFO', f"Merge-child mesh '{name}': {_dup} zero-area face(s) removed "
+                                f"(degenerate triangles in source file, normal behaviour).")
+            if _oor:
+                report('WARNING', f"Merge-child mesh '{name}': {_oor} face(s) with out-of-range "
+                                   f"vertex indices removed — possible decoder error.")
             mdb.from_pydata(verts, [], tris)
+            mdb.validate(clean_customdata=False)  # logging done above via pre-scan
             mdb.update(calc_edges=True)
             used = sorted(set(face_subsets))
             remap = {s: i for i, s in enumerate(used)}
@@ -2750,7 +2779,17 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
             verts = [(shape.positions[i].x, shape.positions[i].y, shape.positions[i].z)
                      for i in slot_vert_indices]
             mdb = _bpy.data.meshes.new(name=name)
+            _nv = len(verts)
+            _dup = sum(1 for fv in slot_tri_locals if len(set(fv)) < len(fv))
+            _oor = sum(1 for fv in slot_tri_locals if len(set(fv)) == len(fv) and any(i < 0 or i >= _nv for i in fv))
+            if _dup:
+                report('INFO', f"Merge-group slot mesh '{name}': {_dup} zero-area face(s) removed "
+                                f"(degenerate triangles in source file, normal behaviour).")
+            if _oor:
+                report('WARNING', f"Merge-group slot mesh '{name}': {_oor} face(s) with out-of-range "
+                                   f"vertex indices removed — possible decoder error.")
             mdb.from_pydata(verts, [], slot_tri_locals)
+            mdb.validate(clean_customdata=False)  # logging done above via pre-scan
             mdb.update(calc_edges=True)
 
             # ---- Materials (only used subsets) ----
