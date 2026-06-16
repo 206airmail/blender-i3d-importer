@@ -528,6 +528,18 @@ class FS25_OT_prepare_for_community_exporter(Operator):
         # Standard gloss discoverability (independent of custom shader).
         self._rename_glossmap_node(mat)
 
+        # alphaBlending round-trip. The community exporter writes
+        # <Material alphaBlending="true"> from i3d_attributes.alpha_blending
+        # (shader_picker.py i3d_map), NOT from blend_method - it never reads
+        # blend_method at all. The importer flags transparent materials
+        # (diffuse alpha < 1, or the i3d's alphaBlending attr) by setting
+        # blend_method='BLEND', so mirror that into alpha_blending here.
+        # Independent of customShader, so it runs before the skip check below.
+        try:
+            attrs.alpha_blending = (mat.blend_method == 'BLEND')
+        except AttributeError:
+            pass
+
         shader_path = mat.get('customShader')
         if not shader_path:
             # Plain material: BSDF Base Color / Normal already export via the
@@ -617,6 +629,15 @@ class FS25_OT_prepare_for_community_exporter(Operator):
             except Exception as e:  # never let one material abort the batch
                 self.report({'WARNING'}, f"'{mat.name}': {e}")
                 continue
+            # The community exporter reads materials from the DEPSGRAPH-evaluated
+            # object (node_classes/shape.py: evaluated_get(...).material_slots).
+            # shader_name/params/alpha_blending are stored as custom IDProperties,
+            # and writing those does NOT tag the material for depsgraph re-eval -
+            # so without this the exporter sees the stale import-time copy and
+            # drops ALL shader data (customShaderId/CustomParameter/alphaBlending).
+            # update_tag() flags the datablock dirty so the exporter's
+            # evaluated_depsgraph_get() refreshes it before reading.
+            mat.update_tag()
             if status == 'ok':
                 n_ok += 1
             elif status == 'no_shader':
