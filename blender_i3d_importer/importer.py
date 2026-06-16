@@ -96,6 +96,7 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
                auto_hide_invisible_shapes: bool = True,
                build_pbr_debug_materials: bool = True,
                attach_debug_materials_to_mesh: bool = False,
+               add_sort_order_prefix: bool = True,
                terrain_lod: str = 'OFF',
                terrain_base_color=(0.03434, 0.042311, 0.012286, 1.0),
                terrain_poc_layer_names: str = "ASPHALT,GRASS,MUD,FOREST_LEAVES,FOREST_GRASS",
@@ -321,6 +322,11 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         # collect hides during tree walk, apply AFTER axis correction.
         objects_to_hide: list = []
 
+        if add_sort_order_prefix:
+            _skin_excluded_ids = set()
+            _collect_skinweight_excluded_ids(roots_to_process, _skin_excluded_ids)
+            _apply_sort_order_prefix(roots_to_process, _skin_excluded_ids)
+
         for root in roots_to_process:
             _build_node(root, parent=None, collection=import_collection,
                         scene=scene,
@@ -466,6 +472,61 @@ def _has_any_shape_nodes(node) -> bool:
     if node.kind == 'Shape':
         return True
     return any(_has_any_shape_nodes(c) for c in node.children)
+
+
+def _strip_sort_prefix(name):
+    """Remove a leading 4-digit sort-order prefix ('0010:') added by
+    _apply_sort_order_prefix. Used when deriving bone names from object names:
+    the Giants exporter writes bone names verbatim (getBoneData does NOT strip
+    the ':' prefix, unlike object node names), so a prefixed bone name would
+    leak into the .i3d. No-op when the prefix feature is off."""
+    return re.sub(r"^\d{4}:", "", name or "")
+
+
+def _collect_skinweight_excluded_ids(nodes, excluded):
+    """Collect nodeIds of skin-weights shapes and their bind-target bones so
+    they are NOT given a sort-order prefix. The Giants exporter breaks the
+    skin/armature linkage when these nodes are renamed: the joint icon is lost
+    and the bones export as plain TransformGroups (confirmed empirically, see
+    GitHub #13 / #6). Skin-weights is distinguished from a merge group by the
+    rule (verified against base-game files): a skin-weights shape's own nodeId
+    is NOT the first entry of skinBindNodeIds, whereas a merge-group root lists
+    itself first. Merge groups are therefore left prefixed."""
+    for n in nodes:
+        sb = (n.raw_attrs or {}).get("skinBindNodeIds")
+        if sb:
+            try:
+                ids = [int(x) for x in sb.split()]
+            except ValueError:
+                ids = []
+            if ids and ids[0] != n.nodeId:        # skin-weights, not merge group
+                excluded.add(n.nodeId)
+                excluded.update(ids)
+        if n.children:
+            _collect_skinweight_excluded_ids(n.children, excluded)
+
+
+def _apply_sort_order_prefix(nodes, excluded=None):
+    """Prepend a 4-digit, 10-step sort key to every scene node name so the
+    Giants exporter (sortChilder() sorts children alphabetically) reproduces
+    the original GE scenegraph order on re-export. The exporter strips
+    everything up to the last ':' on export (dccBlender.getFormattedNodeName),
+    so the prefix never reaches the .i3d. Recursive; index = sibling position.
+    A pre-existing ':' in the real name is replaced with '.' so the exporter
+    does not mis-strip it.
+
+    Nodes whose nodeId is in `excluded` (skin-weights shapes + their bind-target
+    bones) keep their original name -- see _collect_skinweight_excluded_ids.
+    The sibling index still advances for them so the remaining siblings keep a
+    stable numbering."""
+    if excluded is None:
+        excluded = set()
+    for i, node in enumerate(nodes):
+        if node.nodeId not in excluded:
+            clean = (node.name or "").replace(":", ".")
+            node.name = f"{(i + 1) * 10:04d}:{clean}"
+        if node.children:
+            _apply_sort_order_prefix(node.children, excluded)
 
 
 def _build_node(node, parent, collection, scene, mesh_cache, material_cache,
@@ -2477,7 +2538,7 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
                 if src is None:
                     base_name = f"__skin_missing_{nid}"
                 else:
-                    base_name = src.name
+                    base_name = _strip_sort_prefix(src.name)
                 # Ensure unique bone names within this armature.
                 name = base_name
                 suffix = 1

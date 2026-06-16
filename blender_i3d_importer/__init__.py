@@ -157,6 +157,16 @@ class FS25I3DImporterPreferences(AddonPreferences):
                     "before re-export when this flag is on.",
         default=False,
     )
+    add_sort_order_prefix_default: BoolProperty(
+        name="Add GE sort-order prefix by default",
+        description="Default for the operator checkbox 'Add GE sort-order "
+                    "prefix'. Prepends a 4-digit sort key (0010, 0020, ...) to "
+                    "every imported node name so the Giants exporter reproduces "
+                    "the original Giants Editor scenegraph order on re-export. "
+                    "The exporter strips the prefix, so it never reaches the "
+                    ".i3d. Can still be overridden per import.",
+        default=True,
+    )
     terrain_lod_default: EnumProperty(
         name="Terrain LOD by default",
         description="Vertex density for the terrain mesh on import. Lower "
@@ -207,6 +217,7 @@ class FS25I3DImporterPreferences(AddonPreferences):
         box.prop(self, "auto_hide_invisible_shapes_default")
         box.prop(self, "build_pbr_debug_materials_default")
         box.prop(self, "attach_debug_materials_to_mesh_default")
+        box.prop(self, "add_sort_order_prefix_default")
 
         box = layout.box()
         box.label(text="Terrain", icon='WORLD')
@@ -273,6 +284,18 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
         default=False,  # overridden in invoke() from prefs
     )
 
+    add_sort_order_prefix: BoolProperty(
+        name="Add GE sort-order prefix",
+        description=(
+            "Prepend a 4-digit sort key (0010, 0020, ...) to every imported "
+            "node name so the Giants exporter reproduces the original Giants "
+            "Editor scenegraph order on re-export. The exporter strips the "
+            "prefix, so it never reaches the .i3d. Default comes from add-on "
+            "preferences."
+        ),
+        default=True,  # overridden in invoke() from prefs
+    )
+
     terrain_lod: EnumProperty(
         name="Terrain LOD",
         description=(
@@ -323,6 +346,7 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
         self.auto_hide_invisible_shapes = prefs.auto_hide_invisible_shapes_default
         self.build_pbr_debug_materials = prefs.build_pbr_debug_materials_default
         self.attach_debug_materials_to_mesh = prefs.attach_debug_materials_to_mesh_default
+        self.add_sort_order_prefix = prefs.add_sort_order_prefix_default
         self.terrain_lod = prefs.terrain_lod_default
         self.terrain_base_color = prefs.terrain_base_color
         self.terrain_poc_layer_names = prefs.terrain_poc_layer_names
@@ -364,6 +388,7 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
                 auto_hide_invisible_shapes=self.auto_hide_invisible_shapes,
                 build_pbr_debug_materials=self.build_pbr_debug_materials,
                 attach_debug_materials_to_mesh=self.attach_debug_materials_to_mesh,
+                add_sort_order_prefix=self.add_sort_order_prefix,
                 terrain_lod=self.terrain_lod,
                 terrain_base_color=tuple(self.terrain_base_color),
                 terrain_poc_layer_names=self.terrain_poc_layer_names,
