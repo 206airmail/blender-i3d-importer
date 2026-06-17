@@ -495,12 +495,38 @@ class FS25_OT_prepare_for_community_exporter(Operator):
     nothing is selected). Run it after switching slots to the Export
     materials (the debug materials carry no re-export properties).
 
-    Also bridges shape-level flags: the importer stores the i3d shape
-    attributes as i3D_<name> object properties (for the official exporter);
-    the community exporter reads them from the mesh-data i3d_attributes
-    PropertyGroup. Mirrors nonRenderable (collisions/triggers), castsShadows,
-    receiveShadows, renderedInViewports, terrainDecal, doubleSided and cpuMesh
-    so GE shape settings re-export correctly.
+    Also bridges the node/shape attributes the importer stores as i3D_<name>
+    object properties (for the official exporter) into the community exporter's
+    Object.i3d_attributes (node level) and Mesh.i3d_attributes (shape level),
+    plus Object.i3d_reference for reference nodes:
+
+      * Shape flags: nonRenderable (collisions/triggers), castsShadows,
+        receiveShadows, renderedInViewports, terrainDecal, doubleSided,
+        occluder, cpuMesh (-> meshUsage), decalLayer, navMeshMask.
+      * Node attributes: clipDistance, objectMask, LOD distances, the full
+        rigid-body / collision / physics block (rigidBodyType from the
+        static/dynamic/kinematic/compoundChild bools, collision filters,
+        friction, damping, density, ...), joints, split type/UVs, locked group
+        and visibility conditions (time of day / day of year / weather /
+        viewer-spaciality masks).
+      * References: referenceFilename / childPath / runtimeLoaded.
+      * Merge groups (i3D_mergeGroup/Root -> scene.i3dio_merge_groups) so the
+        exporter re-merges grouped shapes instead of exploding them, plus
+        bounding volumes and merge-children flags.
+      * User attributes (userAttribute_<type>_<name>) -> i3d_user_attributes,
+        so script hooks round-trip.
+
+    uint32 bitmasks are converted from the importer's decimal storage back to
+    the hex strings the community exporter expects, and physics/joint/visibility
+    fields are gated the way they're gated in the editor (e.g. collision only on
+    a rigid body) so we never emit physics on a non-rigid shape.
+
+    For the few things this intentionally does not cover (legacy FS19/22
+    vehicleShader UDIM conversion, i3d node-name mappings), the maintained
+    'Migrate from Giants to Community Exporter' tool in i3d_exporter_additionals
+    operates on the same i3D_* props. This bridge is non-destructive and
+    re-runnable (it keeps the i3D_* props and Giants-exporter compatibility);
+    that migration tool is one-way (it deletes the keys).
 
     Safe to re-run; it overwrites only the bridged fields.
     """
@@ -641,20 +667,412 @@ class FS25_OT_prepare_for_community_exporter(Operator):
                 + f", {applied_params} param(s), {applied_tex} texture(s)")
 
     @staticmethod
-    def _gather_mesh_objects(context):
-        """Mesh objects to bridge shape attributes for. ALWAYS scene-wide over
-        imported i3d meshes (those carrying an i3D_* shape prop), NOT
-        selection-scoped: nonRenderable shapes (collisions, triggers) are
-        hidden by the importer and therefore can't be selected, so a
-        selection-only gather would silently miss exactly the shapes this is
-        meant to flag."""
-        return [o for o in bpy.data.objects
-                if o.type == 'MESH' and o.data is not None
-                and any(k.startswith('i3D_') for k in o.keys())]
+    def _gather_i3d_objects(context):
+        """All imported i3d objects (mesh AND empty/transform-group), scene-wide.
 
-    # Importer object prop (i3D_*, all bools) -> community mesh-data
-    # i3d_attributes BoolProperty. cpuMesh is handled separately because the
-    # community side is an EnumProperty ('0'/'256' -> meshUsage), not a bool.
+        Object-level node attributes (clipDistance, LOD, physics/rigid body,
+        joints, visibility conditions, bitmasks, references) live on BOTH meshes
+        and the empties that represent TransformGroups, so this is neither
+        type- nor selection-scoped: nonRenderable shapes (collisions, triggers)
+        are hidden by the importer and can't be selected, and LOD / visibility-
+        condition / reference data lives on empties that are never 'selected
+        meshes' - a selection- or mesh-only gather would silently miss exactly
+        those nodes. The community addon registers i3d_attributes on every
+        bpy.types.Object, so any imported node (carrying an i3D_* prop) qualifies."""
+        return [o for o in bpy.data.objects
+                if any(k.startswith('i3D_') for k in o.keys())]
+
+    @staticmethod
+    def _set(attrs, name, value):
+        """Guarded setattr - tolerates a community attr that doesn't exist on
+        this addon version, or a value the property rejects. Returns 1 on a
+        successful write, else 0 (so callers can count bridged fields)."""
+        if not hasattr(attrs, name):
+            return 0
+        try:
+            setattr(attrs, name, value)
+            return 1
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @staticmethod
+    def _dec_to_hex(value):
+        """The importer stores uint32 bitmasks as DECIMAL strings
+        (i3d_attr_mapping._hex_or_dec_to_decstr); the community exporter expects
+        HEX strings - xml_i3d.write_i3d_properties does int(value, 16) on them.
+        Convert a decimal (or already-0x-prefixed) value to a bare lowercase hex
+        string, or None if it isn't a valid 32-bit unsigned int."""
+        try:
+            n = int(str(value).strip(), 0)
+        except (ValueError, TypeError):
+            return None
+        if not (0 <= n <= 0xFFFFFFFF):
+            return None
+        return format(n, 'x')
+
+    # Giants default mask values the i3dio side treats as "unset" - skip them
+    # rather than emit a redundant attribute (matches i3d_exporter_additionals'
+    # giants_to_i3dio.GIANTS_DEFAULT_MASK_VALUES).
+    _DEFAULT_MASKS = frozenset((0, 255, 0xFFFFFFFF))
+
+    # ---- Object-level node attributes (community Object.i3d_attributes) -----
+    # (importer prop, community attr, gate). gate decides whether the field is
+    # written, mirroring the conditional migration the reference tool does:
+    #   ''        always
+    #   'clip'    skip when value == 0.0 (Giants "no clip" default)
+    #   'rb'      only when a rigid body type is set
+    #   'compound' only when rigid body is dynamic/kinematic
+    #   'joint'   only when the node is a joint
+    #   'vis'     only when the node has its own visibility condition
+    _OBJ_BOOL_MAP = (
+        ('i3D_lockedGroup',    'locked_group',    ''),
+        ('i3D_collision',      'collision',       'rb'),
+        ('i3D_compound',       'compound',        'compound'),
+        ('i3D_trigger',        'trigger',         'rb'),
+        ('i3D_renderInvisible', 'render_invisible', 'vis'),
+        ('i3D_projection',     'projection',      'joint'),
+        ('i3D_xAxisDrive',     'x_axis_drive',    'joint'),
+        ('i3D_yAxisDrive',     'y_axis_drive',    'joint'),
+        ('i3D_zAxisDrive',     'z_axis_drive',    'joint'),
+        ('i3D_drivePos',       'drive_position',  'joint'),
+        ('i3D_breakableJoint', 'breakable_joint', 'joint'),
+    )
+    _OBJ_FLOAT_MAP = (
+        ('i3D_clipDistance',       'clip_distance',            'clip'),
+        ('i3D_restitution',        'restitution',              'rb'),
+        ('i3D_staticFriction',     'static_friction',          'rb'),
+        ('i3D_dynamicFriction',    'dynamic_friction',         'rb'),
+        ('i3D_linearDamping',      'linear_damping',           'rb'),
+        ('i3D_angularDamping',     'angular_damping',          'rb'),
+        ('i3D_density',            'density',                  'rb'),
+        ('i3D_visibleShaderParam', 'visible_shader_parameter', 'vis'),
+        ('i3D_projDistance',       'projection_distance',      'joint'),
+        ('i3D_projAngle',          'projection_angle',         'joint'),
+        ('i3D_driveForceLimit',    'drive_force_limit',        'joint'),
+        ('i3D_driveSpring',        'drive_spring',             'joint'),
+        ('i3D_driveDamping',       'drive_damping',            'joint'),
+        ('i3D_jointBreakForce',    'joint_break_force',        'joint'),
+        ('i3D_jointBreakTorque',   'joint_break_torque',       'joint'),
+    )
+    _OBJ_INT_MAP = (
+        ('i3D_solverIterationCount', 'solver_iteration_count', 'rb'),
+        ('i3D_minuteOfDayStart',     'minute_of_day_start',    'vis'),
+        ('i3D_minuteOfDayEnd',       'minute_of_day_end',      'vis'),
+        ('i3D_dayOfYearStart',       'day_of_year_start',      'vis'),
+        ('i3D_dayOfYearEnd',         'day_of_year_end',        'vis'),
+    )
+    _OBJ_HEX_MAP = (
+        ('i3D_objectMask',                  'object_mask',                     ''),
+        ('i3D_collisionFilterGroup',        'collision_filter_group',          'rb'),
+        ('i3D_collisionFilterMask',         'collision_filter_mask',           'rb'),
+        ('i3D_weatherMask',                 'weather_required_mask',           'vis'),
+        ('i3D_weatherPreventMask',          'weather_prevent_mask',            'vis'),
+        ('i3D_viewerSpacialityMask',        'viewer_spaciality_required_mask', 'vis'),
+        ('i3D_viewerSpacialityPreventMask', 'viewer_spaciality_prevent_mask',  'vis'),
+    )
+    # importer's 4 mutually-exclusive rigid-body bools -> the community's single
+    # rigid_body_type enum. The exporter writes the enum VALUE as the attribute
+    # name (static="1" etc.) because i3d_map has no 'name' for it.
+    _RIGID_BODY_MAP = (
+        ('i3D_static',        'static'),
+        ('i3D_dynamic',       'dynamic'),
+        ('i3D_kinematic',     'kinematic'),
+        ('i3D_compoundChild', 'compoundChild'),
+    )
+    # Own visibility conditions only take effect when the node does NOT inherit
+    # from its parent; presence of any of these means use_parent must be cleared.
+    _VIS_COND_KEYS = (
+        'i3D_minuteOfDayStart', 'i3D_minuteOfDayEnd',
+        'i3D_dayOfYearStart', 'i3D_dayOfYearEnd',
+        'i3D_weatherMask', 'i3D_weatherPreventMask',
+        'i3D_viewerSpacialityMask', 'i3D_viewerSpacialityPreventMask',
+        'i3D_renderInvisible', 'i3D_visibleShaderParam',
+    )
+
+    @classmethod
+    def _bridge_object_attrs(cls, obj):
+        """Mirror the importer's object-level i3D_<name> node props into the
+        community exporter's Object.i3d_attributes: clipDistance, objectMask,
+        LOD, the full rigid-body / collision / physics block, joints, split UVs
+        and visibility conditions. The exporter reads these from the ORIGINAL
+        object (node.py: blender_object.i3d_attributes), so - unlike materials -
+        no depsgraph update_tag() is needed. Only props the i3d actually
+        recorded are written, and each is gated the way the reference tool gates
+        it (physics only on rigid bodies, joint sub-attrs only on joints, etc.)
+        so we don't emit physics on a non-rigid shape. Returns the field count."""
+        if not hasattr(obj, 'i3d_attributes'):
+            return 0
+        attrs = obj.i3d_attributes
+        n = 0
+
+        # Determine the gating state FIRST - the physics block keys off the
+        # rigid body type, and the visibility-condition block off use_parent.
+        rbt = 'none'
+        for okey, enum_val in cls._RIGID_BODY_MAP:
+            if bool(obj.get(okey)):
+                rbt = enum_val
+                break
+        if rbt != 'none':
+            n += cls._set(attrs, 'rigid_body_type', rbt)
+        has_rb = rbt != 'none'
+        has_joint = bool(obj.get('i3D_joint'))
+        has_vis = any(k in obj.keys() for k in cls._VIS_COND_KEYS)
+
+        # Joint flag + visibility-inherit flag, set before their sub-attributes.
+        if has_joint:
+            n += cls._set(attrs, 'joint', True)
+        if has_vis:
+            # Conditions are ignored by the engine while use_parent is on.
+            n += cls._set(attrs, 'use_parent', False)
+
+        def gated(gate):
+            if gate == 'rb':
+                return has_rb
+            if gate == 'compound':
+                return rbt in ('dynamic', 'kinematic')
+            if gate == 'joint':
+                return has_joint
+            if gate == 'vis':
+                return has_vis
+            return True
+
+        for okey, aname, gate in cls._OBJ_BOOL_MAP:
+            if okey in obj.keys() and gated(gate):
+                n += cls._set(attrs, aname, bool(obj[okey]))
+        for okey, aname, gate in cls._OBJ_FLOAT_MAP:
+            if okey not in obj.keys() or not gated(gate):
+                continue
+            try:
+                val = float(obj[okey])
+            except (TypeError, ValueError):
+                continue
+            if gate == 'clip' and val == 0.0:
+                continue  # Giants "no clip" default; i3dio default is 1e6
+            n += cls._set(attrs, aname, val)
+        for okey, aname, gate in cls._OBJ_INT_MAP:
+            if okey in obj.keys() and gated(gate):
+                try:
+                    n += cls._set(attrs, aname, int(obj[okey]))
+                except (TypeError, ValueError):
+                    pass
+        for okey, aname, gate in cls._OBJ_HEX_MAP:
+            if okey not in obj.keys() or not gated(gate):
+                continue
+            try:
+                raw = int(str(obj[okey]).strip(), 0)
+            except (TypeError, ValueError):
+                continue
+            if raw in cls._DEFAULT_MASKS:
+                continue  # redundant Giants default (0 / ff / ffffffff)
+            hx = cls._dec_to_hex(raw)
+            if hx is not None:
+                n += cls._set(attrs, aname, hx)
+
+        # LOD: importer keeps i3D_lod1/2/3 (the three distances after the
+        # mandatory leading 0); community wants a 4-float vector (0, l1, l2, l3).
+        # Needs >=2 children for a valid LOD group (LOD0 + at least one level).
+        if (obj.get('i3D_lod') or any(f'i3D_lod{i}' in obj.keys() for i in (1, 2, 3))) \
+                and len(obj.children) >= 2:
+            lod = [0.0, 0.0, 0.0, 0.0]
+            for i in (1, 2, 3):
+                v = obj.get(f'i3D_lod{i}')
+                if v is not None:
+                    try:
+                        lod[i] = float(v)
+                    except (TypeError, ValueError):
+                        pass
+            n += cls._set(attrs, 'lod_distances', lod)
+
+        # split type + UVs: only meaningful on a static rigid body.
+        if rbt == 'static' and 'i3D_splitType' in obj.keys():
+            try:
+                st = int(obj['i3D_splitType'])
+            except (TypeError, ValueError):
+                st = 0
+            if st != 0:
+                n += cls._set(attrs, 'split_type', st)
+                split_keys = ('i3D_splitMinU', 'i3D_splitMinV', 'i3D_splitMaxU',
+                              'i3D_splitMaxV', 'i3D_splitUvWorldScale')
+                if any(k in obj.keys() for k in split_keys):
+                    vals = [0.0, 0.0, 1.0, 1.0, 1.0]
+                    for idx, k in enumerate(split_keys):
+                        v = obj.get(k)
+                        if v is not None:
+                            try:
+                                vals[idx] = float(v)
+                            except (TypeError, ValueError):
+                                pass
+                    n += cls._set(attrs, 'split_uvs', vals)
+
+        # Merge children (tree shapes etc.): importer flags the root empty.
+        if obj.get('i3D_mergeChildren') and hasattr(obj, 'i3d_merge_children'):
+            try:
+                obj.i3d_merge_children.enabled = True
+                n += 1
+            except (TypeError, ValueError):
+                pass
+
+        return n
+
+    # Giants userAttribute_<type>_<name> -> i3dio user-attribute item field.
+    _UA_TYPE_FIELD = {
+        'boolean': 'data_boolean', 'string': 'data_string',
+        'scriptCallback': 'data_scriptCallback',
+        'float': 'data_float', 'integer': 'data_integer',
+    }
+
+    @classmethod
+    def _bridge_user_attributes(cls, obj):
+        """Mirror the importer's userAttribute_<type>_<name> custom props into
+        the community exporter's Object.i3d_user_attributes list, so script
+        hooks (onCreate callbacks, originalNodeId, liw flags, ...) round-trip.
+        Re-run safe: skips names already present. Returns the count added."""
+        if not hasattr(obj, 'i3d_user_attributes'):
+            return 0
+        ua = obj.i3d_user_attributes
+        existing = {a.name for a in ua.attribute_list}
+        added = 0
+        for key in list(obj.keys()):
+            if not key.startswith('userAttribute_'):
+                continue
+            parts = key.split('_', 2)
+            if len(parts) != 3:
+                continue
+            _, atype, aname = parts
+            field = cls._UA_TYPE_FIELD.get(atype)
+            if field is None or aname in existing:
+                continue
+            item = ua.attribute_list.add()
+            item.name = aname
+            item.type = field
+            try:
+                val = obj[key]
+                if atype == 'boolean':
+                    item.data_boolean = bool(val)
+                elif atype == 'integer':
+                    item.data_integer = int(val)
+                elif atype == 'float':
+                    item.data_float = float(val)
+                else:  # string / scriptCallback
+                    setattr(item, field, str(val))
+            except (TypeError, ValueError):
+                ua.attribute_list.remove(len(ua.attribute_list) - 1)
+                continue
+            existing.add(aname)
+            added += 1
+        return added
+
+    @staticmethod
+    def _bridge_merge_groups(context):
+        """Reconstruct community merge groups from the importer's i3D_mergeGroup
+        / i3D_mergeGroupRoot props so the exporter RE-MERGES grouped shapes
+        (decals, tracks, ...) into single shapes, instead of exploding each
+        member into its own Shape (which otherwise inflates per-shape attributes
+        like decalLayer/castsShadows across every piece). Re-run safe via the
+        group name. Returns (n_groups, n_members, {giants_group_id: mg_index})."""
+        scene = context.scene
+        if not hasattr(scene, 'i3dio_merge_groups'):
+            return (0, 0, {})
+        group_map = {}   # giants group id -> [member objs]
+        root_map = {}    # giants group id -> root obj
+        for obj in bpy.data.objects:
+            if obj.type != 'MESH':
+                continue
+            gid = obj.get('i3D_mergeGroup')
+            if gid is None:
+                continue
+            try:
+                gid = int(gid)
+            except (TypeError, ValueError):
+                continue
+            if gid < 1:   # 0 = no merge group in the Giants exporter
+                continue
+            group_map.setdefault(gid, []).append(obj)
+            if obj.get('i3D_mergeGroupRoot'):
+                root_map[gid] = obj
+
+        gid_to_index = {}
+        n_members = 0
+        for gid in sorted(group_map):
+            members = group_map[gid]
+            name = f"MergeGroup_{gid}"
+            idx = scene.i3dio_merge_groups.find(name)
+            if idx == -1:
+                mg = scene.i3dio_merge_groups.add()
+                mg.name = name
+                idx = len(scene.i3dio_merge_groups) - 1
+            else:
+                mg = scene.i3dio_merge_groups[idx]
+            for o in members:
+                o.i3d_merge_group_index = idx
+                n_members += 1
+            mg.root = root_map.get(gid, members[0])
+            gid_to_index[gid] = idx
+        return (len(group_map), n_members, gid_to_index)
+
+    @staticmethod
+    def _bridge_bounding_volumes(context, gid_to_index):
+        """Mirror i3D_boundingVolume into the community exporter's
+        Mesh.i3d_attributes.bounding_volume_object. The value is either a target
+        object name or 'MERGEGROUP_<n>' (-> the merge group's root). The object
+        carrying the prop becomes the bounding volume of the target. Returns the
+        count assigned."""
+        scene = context.scene
+        mgroups = getattr(scene, 'i3dio_merge_groups', None)
+        n = 0
+        for bv_obj in bpy.data.objects:
+            if bv_obj.type != 'MESH':
+                continue
+            bv = bv_obj.get('i3D_boundingVolume')
+            if not bv or str(bv) in ('', 'None'):
+                continue
+            bv = str(bv)
+            if bv.startswith('MERGEGROUP_'):
+                try:
+                    gnum = int(bv.split('_')[1])
+                except (IndexError, ValueError):
+                    continue
+                idx = gid_to_index.get(gnum)
+                if idx is None or mgroups is None or idx >= len(mgroups):
+                    continue
+                target = mgroups[idx].root
+            else:
+                target = bpy.data.objects.get(bv)
+            if (target is None or target.data is None
+                    or not hasattr(target.data, 'i3d_attributes')):
+                continue
+            try:
+                target.data.i3d_attributes.bounding_volume_object = bv_obj
+                n += 1
+            except (TypeError, ValueError):
+                pass
+        return n
+
+    @staticmethod
+    def _bridge_reference(obj):
+        """Mirror an imported i3d Reference node (i3D_referenceFilename /
+        ChildPath / RuntimeLoaded) into the community exporter's
+        Object.i3d_reference, so referenced sub-i3ds (wheels, shared parts)
+        round-trip. Returns 1 if a reference path was written, else 0."""
+        ref_path = obj.get('i3D_referenceFilename')
+        if not ref_path or not hasattr(obj, 'i3d_reference'):
+            return 0
+        ref = obj.i3d_reference
+        try:
+            ref.path = str(ref_path)
+            cp = obj.get('i3D_referenceChildPath')
+            if cp:
+                ref.child_path = str(cp)
+            if 'i3D_referenceRuntimeLoaded' in obj.keys():
+                ref.runtime_loaded = bool(obj['i3D_referenceRuntimeLoaded'])
+        except (TypeError, ValueError):
+            return 0
+        return 1
+
+    # Importer object prop (i3D_*, bool) -> community mesh-data i3d_attributes
+    # BoolProperty. cpuMesh / decalLayer / navMeshMask need their own conversion
+    # (enum / int / hex) and are handled in _bridge_shape. Note occluder maps to
+    # the importer's i3D_oc (per i3d_attr_mapping), not i3D_occluder.
     _SHAPE_FLAG_MAP = (
         ('i3D_nonRenderable',       'non_renderable'),
         ('i3D_castsShadows',        'casts_shadows'),
@@ -662,6 +1080,7 @@ class FS25_OT_prepare_for_community_exporter(Operator):
         ('i3D_renderedInViewports', 'rendered_in_viewports'),
         ('i3D_terrainDecal',        'terrain_decal'),
         ('i3D_doubleSided',         'double_sided'),
+        ('i3D_oc',                  'is_occluder'),
     )
 
     @classmethod
@@ -669,8 +1088,8 @@ class FS25_OT_prepare_for_community_exporter(Operator):
         """Mirror the importer's i3D_<flag> object props into the community
         exporter's mesh-data i3d_attributes shape flags, so GE shape settings
         round-trip: nonRenderable (collisions/triggers), castsShadows,
-        receiveShadows, renderedInViewports, terrainDecal, doubleSided and
-        cpuMesh (-> meshUsage).
+        receiveShadows, renderedInViewports, terrainDecal, doubleSided, occluder,
+        cpuMesh (-> meshUsage), decalLayer and navMeshMask.
 
         Only flags the i3d actually recorded (present on the object) are
         written; omitted attributes keep the community exporter's own
@@ -686,26 +1105,37 @@ class FS25_OT_prepare_for_community_exporter(Operator):
         applied = 0
         for okey, aname in cls._SHAPE_FLAG_MAP:
             if okey in obj.keys():
-                setattr(attrs, aname, bool(obj[okey]))
-                applied += 1
+                applied += cls._set(attrs, aname, bool(obj[okey]))
         # cpuMesh: bool on the importer side, enum ('0' off / '256' on ->
         # meshUsage) on the community side.
         if 'i3D_cpuMesh' in obj.keys():
-            attrs.cpu_mesh = '256' if bool(obj['i3D_cpuMesh']) else '0'
-            applied += 1
+            applied += cls._set(attrs, 'cpu_mesh',
+                                '256' if bool(obj['i3D_cpuMesh']) else '0')
+        # decalLayer: plain int.
+        if 'i3D_decalLayer' in obj.keys():
+            try:
+                applied += cls._set(attrs, 'decal_layer', int(obj['i3D_decalLayer']))
+            except (TypeError, ValueError):
+                pass
+        # navMeshMask: decimal string on the importer side, hex on community.
+        if 'i3D_navMeshMask' in obj.keys():
+            hx = cls._dec_to_hex(obj['i3D_navMeshMask'])
+            if hx is not None:
+                applied += cls._set(attrs, 'nav_mesh_mask', hx)
         return (applied, bool(attrs.non_renderable))
 
     def execute(self, context):
         mats = self._gather_materials(context)
-        mesh_objs = self._gather_mesh_objects(context)
-        if not mats and not mesh_objs:
+        objs = self._gather_i3d_objects(context)
+        if not mats and not objs:
             self.report({'WARNING'}, "No i3d materials or shapes found "
                                      "(select imported meshes, or import first)")
             return {'CANCELLED'}
 
-        # Community addon registers i3d_attributes on bpy.types.Material AND
-        # bpy.types.Mesh. Probe whichever datablock we actually have.
-        probe = mats[0] if mats else mesh_objs[0].data
+        # Community addon registers i3d_attributes on bpy.types.Material,
+        # bpy.types.Object and bpy.types.Mesh. Probe an Object (always present)
+        # or a Material - if neither has it, the addon isn't installed.
+        probe = objs[0] if objs else mats[0]
         if not hasattr(probe, 'i3d_attributes'):
             self.report({'ERROR'},
                         "Community 'GIANTS I3D Community Exporter' addon not "
@@ -736,27 +1166,48 @@ class FS25_OT_prepare_for_community_exporter(Operator):
             else:
                 n_skip += 1
 
-        # Shape-level flags (nonRenderable, shadows, terrainDecal, ...).
-        # Independent of materials, so a collision-only selection (meshes with
-        # no material) still bridges.
-        n_nonrender = 0
-        n_shape_flags = 0
-        for obj in mesh_objs:
+        # Merge groups FIRST (scene-level): so the exporter re-merges grouped
+        # shapes instead of exploding them, and so bounding-volume targets that
+        # reference a merge group can resolve to its root.
+        n_groups, n_mg_members, gid_to_index = self._bridge_merge_groups(context)
+        n_bv = self._bridge_bounding_volumes(context, gid_to_index)
+
+        # Object-level node attributes (clipDistance, objectMask, LOD, rigid
+        # body / collision / physics, joints, visibility conditions, references)
+        # + shape-level flags (nonRenderable, shadows, occluder, ...) + user
+        # attributes (script hooks). All independent of materials, so a
+        # collision-only selection (meshes with no material, or hidden) still
+        # bridges.
+        n_obj_fields = 0       # object-level node attributes written
+        n_shape_flags = 0      # mesh shape flags written
+        n_nonrender = 0        # nonRenderable meshes
+        n_refs = 0             # reference nodes bridged
+        n_ua = 0               # user attributes bridged
+        n_meshes = 0
+        for obj in objs:
             try:
-                applied, is_nr = self._bridge_shape(obj)
-            except Exception as e:  # never let one shape abort the batch
+                n_obj_fields += self._bridge_object_attrs(obj)
+                n_refs += self._bridge_reference(obj)
+                n_ua += self._bridge_user_attributes(obj)
+                if obj.type == 'MESH' and obj.data is not None:
+                    n_meshes += 1
+                    applied, is_nr = self._bridge_shape(obj)
+                    n_shape_flags += applied
+                    if is_nr:
+                        n_nonrender += 1
+            except Exception as e:  # never let one node abort the batch
                 self.report({'WARNING'}, f"'{obj.name}': {e}")
                 continue
-            n_shape_flags += applied
-            if is_nr:
-                n_nonrender += 1
 
         self.report({'INFO'},
-                    f"Community export prep: {n_ok} bridged, "
+                    f"Community export prep: {n_ok} material(s) bridged, "
                     f"{n_noshader} shader-not-found, {n_skip} skipped "
-                    f"(of {len(mats)} material(s)); "
-                    f"{n_shape_flags} shape flag(s) on {len(mesh_objs)} mesh(es), "
-                    f"{n_nonrender} nonRenderable")
+                    f"(of {len(mats)}); {n_obj_fields} node attr(s) + "
+                    f"{n_shape_flags} shape flag(s) over {len(objs)} object(s) "
+                    f"({n_meshes} mesh, {n_nonrender} nonRenderable); "
+                    f"{n_groups} merge group(s)/{n_mg_members} member(s), "
+                    f"{n_bv} bounding volume(s), {n_refs} reference(s), "
+                    f"{n_ua} user attr(s)")
         return {'FINISHED'}
 
 
