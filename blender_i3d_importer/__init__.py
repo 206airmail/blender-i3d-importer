@@ -12,7 +12,7 @@ Decodes the *.i3d.shapes binary directly in Python — no external tool needed.
 bl_info = {
     "name": "i3d Importer",
     "author": "Nadine Brinkmann",
-    "version": (0, 2, 0),
+    "version": (0, 4, 0),
     "blender": (5, 1, 0),
     "location": "File > Import > Farming Simulator i3d (.i3d)",
     "description": (
@@ -157,6 +157,16 @@ class FS25I3DImporterPreferences(AddonPreferences):
                     "before re-export when this flag is on.",
         default=False,
     )
+    add_sort_order_prefix_default: BoolProperty(
+        name="Add GE sort-order prefix by default",
+        description="Default for the operator checkbox 'Add GE sort-order "
+                    "prefix'. Prepends a 4-digit sort key (0010, 0020, ...) to "
+                    "every imported node name so the Giants exporter reproduces "
+                    "the original Giants Editor scenegraph order on re-export. "
+                    "The exporter strips the prefix, so it never reaches the "
+                    ".i3d. Can still be overridden per import.",
+        default=True,
+    )
     terrain_lod_default: EnumProperty(
         name="Terrain LOD by default",
         description="Vertex density for the terrain mesh on import. Lower "
@@ -207,6 +217,7 @@ class FS25I3DImporterPreferences(AddonPreferences):
         box.prop(self, "auto_hide_invisible_shapes_default")
         box.prop(self, "build_pbr_debug_materials_default")
         box.prop(self, "attach_debug_materials_to_mesh_default")
+        box.prop(self, "add_sort_order_prefix_default")
 
         box = layout.box()
         box.label(text="Terrain", icon='WORLD')
@@ -273,6 +284,18 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
         default=False,  # overridden in invoke() from prefs
     )
 
+    add_sort_order_prefix: BoolProperty(
+        name="Add GE sort-order prefix",
+        description=(
+            "Prepend a 4-digit sort key (0010, 0020, ...) to every imported "
+            "node name so the Giants exporter reproduces the original Giants "
+            "Editor scenegraph order on re-export. The exporter strips the "
+            "prefix, so it never reaches the .i3d. Default comes from add-on "
+            "preferences."
+        ),
+        default=True,  # overridden in invoke() from prefs
+    )
+
     terrain_lod: EnumProperty(
         name="Terrain LOD",
         description=(
@@ -323,6 +346,7 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
         self.auto_hide_invisible_shapes = prefs.auto_hide_invisible_shapes_default
         self.build_pbr_debug_materials = prefs.build_pbr_debug_materials_default
         self.attach_debug_materials_to_mesh = prefs.attach_debug_materials_to_mesh_default
+        self.add_sort_order_prefix = prefs.add_sort_order_prefix_default
         self.terrain_lod = prefs.terrain_lod_default
         self.terrain_base_color = prefs.terrain_base_color
         self.terrain_poc_layer_names = prefs.terrain_poc_layer_names
@@ -364,6 +388,7 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
                 auto_hide_invisible_shapes=self.auto_hide_invisible_shapes,
                 build_pbr_debug_materials=self.build_pbr_debug_materials,
                 attach_debug_materials_to_mesh=self.attach_debug_materials_to_mesh,
+                add_sort_order_prefix=self.add_sort_order_prefix,
                 terrain_lod=self.terrain_lod,
                 terrain_base_color=tuple(self.terrain_base_color),
                 terrain_poc_layer_names=self.terrain_poc_layer_names,
@@ -828,6 +853,13 @@ class FS25_PT_i3d_importer_panel(bpy.types.Panel):
         box.operator("fs25.prepare_for_community_exporter",
                      text="Prepare for Community Exporter")
 
+        # Tree season - shown only when the file actually has a
+        # tree-branch debug material (treeBranchShader SEASONAL).
+        if any(m.get('_i3d_tree_branch_debug') for m in bpy.data.materials):
+            box = layout.box()
+            box.label(text="Tree Season")
+            box.prop(context.scene, "fs25_tree_season", text="")
+
 
 class FS25_PT_material_settings(bpy.types.Panel):
     """Sub-panel showing FS25 custom-parameter sliders for the active material.
@@ -1154,6 +1186,35 @@ def menu_func_import(self, context):
     self.layout.operator(IMPORT_OT_fs25_i3d.bl_idname, text="Farming Simulator i3d (.i3d)")
 
 
+# --- Tree season control (treeBranchShader SEASONAL debug materials) -------
+# Season -> (leaf-diffuse quadrant offset, leaves-enabled). The leaf-quadrant
+# Mapping and the 'leaf enable' Value node are tagged by label in the debug
+# material (recipe_loader treeBranchShader block).
+_TREE_SEASON_PRESETS = {
+    'SUMMER': ((0.5, 0.5), 1.0),
+    'AUTUMN': ((0.0, 0.0), 1.0),
+    'WINTER': ((0.5, 0.0), 0.0),   # leaves off -> branches only; offset irrelevant
+    'SPRING': ((0.0, 0.5), 1.0),
+}
+
+
+def _update_tree_season(self, context):
+    """Switch all FS25 tree-branch debug materials to the chosen season."""
+    season = getattr(context.scene, 'fs25_tree_season', 'SUMMER')
+    offset, leaf_enable = _TREE_SEASON_PRESETS.get(season, ((0.5, 0.5), 1.0))
+    for mat in bpy.data.materials:
+        if not mat.get('_i3d_tree_branch_debug'):
+            continue
+        nt = mat.node_tree
+        if nt is None:
+            continue
+        for n in nt.nodes:
+            if n.type == 'MAPPING' and n.label == 'i3d_tree_leaf_quadrant':
+                n.inputs['Location'].default_value = (offset[0], offset[1], 0.0)
+            elif n.type == 'VALUE' and n.label == 'i3d_tree_leaf_enable':
+                n.outputs[0].default_value = leaf_enable
+
+
 def register():
     bpy.utils.register_class(FS25_OT_terrain_base_color_reset)
     bpy.utils.register_class(FS25I3DImporterPreferences)
@@ -1189,11 +1250,28 @@ def register():
         default=False,
         update=_on_debug_mode_change,
     )
+    bpy.types.Scene.fs25_tree_season = EnumProperty(
+        name="Tree Season",
+        description="Season shown by FS25 tree-branch debug materials "
+                    "(treeBranchShader SEASONAL): switches the leaf diffuse "
+                    "quadrant and toggles leaves (Winter = branches only). "
+                    "Debug visualization only - the re-export material is "
+                    "unaffected.",
+        items=[
+            ('SUMMER', "Summer", "Full green leaves"),
+            ('AUTUMN', "Autumn", "Autumn-coloured leaves"),
+            ('WINTER', "Winter", "No leaves (branches only)"),
+            ('SPRING', "Spring", "Spring leaves"),
+        ],
+        default='SUMMER',
+        update=_update_tree_season,
+    )
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    del bpy.types.Scene.fs25_tree_season
     del bpy.types.Scene.fs25_debug_only_active
     del bpy.types.Scene.fs25_debug_mode
     bpy.utils.unregister_class(FS25_PT_debug_view)
